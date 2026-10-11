@@ -405,6 +405,14 @@ void gp_abi_world_config(gp_h_world handle, uint32_t max_faces_per_block, uint32
 		slot->world->cfg.copper.breaks = (u16)copper_breaks;
 	if (iron_breaks != GP_ABI_KEEP)
 		slot->world->cfg.iron.breaks = (u16)iron_breaks;
+
+	/* Existing shields cache these settings when they are created and saved.
+	   Keep them aligned with the host's current world configuration. */
+	for (uint32_t i = 0; i < GP_ABI_MAX_SHIELDS; i++)
+	{
+		if (g_shields[i].used && g_shields[i].world_slot == handle - 1)
+			gp_shield_apply_config(g_shields[i].shield, &slot->world->cfg);
+	}
 }
 
 #define CFG_OUT(field, dst)                                                                                           \
@@ -538,8 +546,9 @@ int gp_abi_reinf_add(gp_h_world handle, int32_t x, int32_t y, int32_t z, uint32_
 
 	/* The tier value decides upgrade versus refusal, so truncating it could turn a
 	   stronger plate into a weaker one and let a downgrade through. Refuse
-	   anything that will not fit rather than lie about it. */
-	if (amount == 0 || amount > 0xFFFFu)
+	   anything that will not fit rather than lie about it. The ceiling is the
+	   record's own 12 bit durability field, not the width of this parameter. */
+	if (amount == 0 || amount > (uint32_t)GP_REINF_DURABILITY_MAX)
 		return 0;
 
 	abi_chunk_ref ref;
@@ -548,6 +557,8 @@ int gp_abi_reinf_add(gp_h_world handle, int32_t x, int32_t y, int32_t z, uint32_
 
 	return gp_chunk_reinf_add(ref.chunk, ref.lx, ref.ly, ref.lz, (gp_face_t)face, (u16)amount) ? 1 : 0;
 }
+
+uint32_t gp_abi_reinf_durability_max(void) { return (uint32_t)GP_REINF_DURABILITY_MAX; }
 
 uint32_t gp_abi_reinf_face_durability(gp_h_world handle, int32_t x, int32_t y, int32_t z, uint32_t face)
 {
@@ -660,6 +671,77 @@ uint32_t gp_abi_weakest_face(gp_h_world handle, int32_t x, int32_t y, int32_t z)
 	}
 
 	return best;
+}
+
+/* --- block flags ---------------------------------------------------------- */
+
+uint32_t gp_abi_block_flag_lock_faces(void) { return (uint32_t)GP_BLOCK_FLAG_LOCK_FACES; }
+
+uint32_t gp_abi_block_flag_piston_free(void) { return (uint32_t)GP_BLOCK_FLAG_PISTON_FREE; }
+
+uint32_t gp_abi_block_flag_all(void) { return (uint32_t)GP_BLOCK_FLAG_ALL; }
+
+uint32_t gp_abi_reinf_flags(gp_h_world handle, int32_t x, int32_t y, int32_t z)
+{
+	abi_world_slot *slot = world_slot(handle);
+
+	abi_chunk_ref ref;
+	if (!chunk_ref(slot, x, y, z, &ref, 0) || !ref.chunk)
+		return (uint32_t)GP_BLOCK_FLAG_NONE;
+
+	return (uint32_t)gp_chunk_reinf_flags(ref.chunk, ref.lx, ref.ly, ref.lz);
+}
+
+int gp_abi_reinf_flags_set(gp_h_world handle, int32_t x, int32_t y, int32_t z, uint32_t flags,
+                           uint32_t mask)
+{
+	abi_world_slot *slot = world_slot(handle);
+
+	/* The shim narrows both to the bits the library defines. A host that passed a
+	   face id where a mask belonged would otherwise be writing it into the record,
+	   and the core would silently mask it away, leaving the caller to believe the
+	   flag it asked for had been set. */
+	mask &= (uint32_t)GP_BLOCK_FLAG_ALL;
+	flags &= (uint32_t)GP_BLOCK_FLAG_ALL;
+
+	/* Never create a chunk to set a flag on: gp_chunk_reinf_flags_set refuses a
+	   block with nothing on it anyway, and creating the chunk first would leave an
+	   allocated chunk behind for a refusal. */
+	abi_chunk_ref ref;
+	if (!chunk_ref(slot, x, y, z, &ref, 0) || !ref.chunk)
+		return 0;
+
+	return gp_chunk_reinf_flags_set(ref.chunk, ref.lx, ref.ly, ref.lz, (u8)flags, (u8)mask) ? 1 : 0;
+}
+
+int gp_abi_reinf_faces_locked(gp_h_world handle, int32_t x, int32_t y, int32_t z)
+{
+	abi_world_slot *slot = world_slot(handle);
+
+	abi_chunk_ref ref;
+	if (!chunk_ref(slot, x, y, z, &ref, 0) || !ref.chunk)
+		return 0;
+
+	gp_block_reinf_t state;
+	if (!gp_chunk_reinf_get(ref.chunk, ref.lx, ref.ly, ref.lz, &state))
+		return 0;
+
+	return gp_block_reinf_faces_locked(&state) ? 1 : 0;
+}
+
+int gp_abi_reinf_piston_free(gp_h_world handle, int32_t x, int32_t y, int32_t z)
+{
+	abi_world_slot *slot = world_slot(handle);
+
+	abi_chunk_ref ref;
+	if (!chunk_ref(slot, x, y, z, &ref, 0) || !ref.chunk)
+		return 0;
+
+	gp_block_reinf_t state;
+	if (!gp_chunk_reinf_get(ref.chunk, ref.lx, ref.ly, ref.lz, &state))
+		return 0;
+
+	return gp_block_reinf_piston_free(&state) ? 1 : 0;
 }
 
 /* --- break resolution ----------------------------------------------------- */

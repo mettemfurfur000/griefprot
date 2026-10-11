@@ -31,12 +31,16 @@ public final class GriefProtPlugin extends JavaPlugin {
     private Faces faces;
     private PluginConfig config;
     private WorldPolicy policy;
+    private ShieldGenerators generators;
     private final Map<UUID, GriefWorld> worlds = new HashMap<>();
 
     @Override
     public void onEnable() {
         saveDefaultConfig();
-        config = ConfigLoader.load(getConfig());
+        config = ConfigLoader.load(getConfig(), message -> getLogger().warning("griefprot: " + message));
+        // Built before the library, because a failed load calls disablePlugin,
+        // which calls onDisable, which walks the worlds this owns.
+        generators = new ShieldGenerators(this);
 
         try {
             abi = new Abi();
@@ -63,15 +67,27 @@ public final class GriefProtPlugin extends JavaPlugin {
         getServer().getPluginManager().registerEvents(new ChunkListener(this), this);
         getServer().getPluginManager().registerEvents(new BreakListener(this), this);
         getServer().getPluginManager().registerEvents(new ExplosionListener(this), this);
-        getServer().getPluginManager().registerEvents(new InteractListener(this), this);
+        InteractListener interact = new InteractListener(this);
+        getServer().getPluginManager().registerEvents(interact, this);
         getServer().getPluginManager().registerEvents(new PistonListener(this), this);
+        getServer().getPluginManager().registerEvents(new ShieldGeneratorListener(this), this);
         DebugOverlay debugOverlay = new DebugOverlay(this);
         getServer().getPluginManager().registerEvents(debugOverlay, this);
         Objects.requireNonNull(getCommand("griefprot"), "plugin.yml must declare the griefprot command")
-                .setExecutor(debugOverlay);
+                .setExecutor(new GriefProtCommand(debugOverlay, new AdminCommand(this)));
         debugOverlay.runTaskTimer(this, 1L, 10L);
-        // getServer().getScheduler().runTaskTimer(this, new ShieldTicker(this), 1L, 1L);
-        new ShieldTicker(this).runTaskTimerAsynchronously(this, 1L, 1L);
+        // Holds are resolved off the click stream, so the one that is actually
+        // responsible for them is this one. Left to the interact events it would
+        // take as long as the server felt like repeating them.
+        getServer().getScheduler().runTaskTimer(this, interact::tick, 1L, 1L);
+        // Shield callbacks inspect Bukkit blocks, so ticking must stay on the
+        // server thread. The clock has one-second precision; per-tick runs add
+        // no timing accuracy.
+        new ShieldTicker(this).runTaskTimer(this, 1L, 20L);
+        // Fuel sits in a furnace slot, and nothing says when it arrives, so this
+        // has to read the world. It is on the main thread for that reason and
+        // costs one visit per loaded generator per second.
+        getServer().getScheduler().runTaskTimer(this, generators::tick, 20L, 20L);
 
         getLogger().info("enabled for " + worlds.size() + " dimension(s)");
     }
@@ -96,6 +112,10 @@ public final class GriefProtPlugin extends JavaPlugin {
             GriefWorld griefWorld = GriefWorld.open(abi, world, policy, config, dataFile, getLogger());
             worlds.put(world.getUID(), griefWorld);
             getLogger().info("tracking " + world.getName() + " at " + dataFile);
+            // A world can already have loaded chunks when the plugin starts, and
+            // those will not raise a ChunkLoadEvent here, so the generators in
+            // them are adopted by hand.
+            generators.adoptLoadedChunks(world);
         } catch (Exception e) {
             getLogger().log(Level.SEVERE, "could not track " + world.getName(), e);
         }
@@ -103,6 +123,7 @@ public final class GriefProtPlugin extends JavaPlugin {
 
     /** Saves and releases a dimension. */
     public void removeWorld(World world) {
+        generators.forget(world);
         GriefWorld griefWorld = worlds.remove(world.getUID());
         if (griefWorld != null) {
             griefWorld.close();
@@ -132,6 +153,11 @@ public final class GriefProtPlugin extends JavaPlugin {
     /** Startup configuration. */
     public PluginConfig config() {
         return config;
+    }
+
+    /** The shield generators a player has built, and the rules they run on. */
+    public ShieldGenerators generators() {
+        return generators;
     }
 
     /** Every tracked dimension. */

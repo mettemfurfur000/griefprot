@@ -7,10 +7,12 @@ author: tem
 load: POSTWORLD
 commands:
   griefprot:
-    description: Toggle a targeted protection debug overlay.
-    usage: /griefprot overlay <reinforcement|shield|details|off>
-    permission: griefprot.debug
+    description: Debug protection overlays and administer protection data.
+    usage: /griefprot <overlay|admin> ...
 permissions:
   griefprot.debug:
     description: Use the GriefProt debug overlays.
+    default: op
+  griefprot.admin:
+    description: Inspect and manage GriefProt protection and shields.
     default: op

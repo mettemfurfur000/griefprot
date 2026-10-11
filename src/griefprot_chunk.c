@@ -32,44 +32,11 @@ static bool block_covered(const gp_shield_block *block, u64 now)
 }
 
 /*
-	Packed on-disk record, 10 bytes total:
-
-	  [0..7]  u16 durability for slot 0..3
-	  [8..9]  slot 0..3 face ids, 3 bits each
-
-	Slot i holding face GP_FACE_NONE is unused. Reading and writing go through
-	gp_block_reinf_t so the packing stays in one place.
+	Packed on-disk record. The layout lives in GP_REC_FIELDS in
+	griefprot_record.h and gp_block_reinf_pack turns it into bytes, so this file
+	never spells out a bit position. What it does own is which fields survive a
+	merge or a move.
 */
-
-static void pack(const gp_block_reinf_t *in, u8 *out)
-{
-	for (u32 i = 0; i < GP_MAX_REINFORCED_FACES; i++)
-	{
-		out[i * 2 + 0] = (u8)(in->durability[i] & 0xFF);
-		out[i * 2 + 1] = (u8)(in->durability[i] >> 8);
-	}
-
-	u16 faces = 0;
-	for (u32 i = 0; i < GP_MAX_REINFORCED_FACES; i++)
-		faces |= (u16)(in->face[i] & 0x7) << (i * 3);
-
-	out[8] = (u8)(faces & 0xFF);
-	out[9] = (u8)(faces >> 8);
-}
-
-static void unpack(const u8 *in, gp_block_reinf_t *out)
-{
-	u16 faces = (u16)(in[8] | ((u16)in[9] << 8));
-
-	out->count = 0;
-	for (u32 i = 0; i < GP_MAX_REINFORCED_FACES; i++)
-	{
-		out->durability[i] = (u16)(in[i * 2 + 0] | ((u16)in[i * 2 + 1] << 8));
-		out->face[i] = (u8)((faces >> (i * 3)) & 0x7);
-		if (out->face[i] != GP_FACE_NONE)
-			out->count++;
-	}
-}
 
 static bool index_valid(const gp_chunk_reinf *chunk, u32 x, u32 y, u32 z)
 {
@@ -86,7 +53,7 @@ static void index_to_xyz(u32 index, u32 *x, u32 *y, u32 *z)
 
 void gp_chunk_reinf_init(gp_chunk_reinf *chunk, u32 chunk_height)
 {
-	gp_sparse_init(&chunk->reinf, GP_SPARSE_REINF_VALUE_SIZE);
+	gp_sparse_init(&chunk->reinf, GP_REC_BYTES);
 	gp_sparse_init(&chunk->shield, GP_SHIELD_BLOCK_VALUE_SIZE);
 	chunk->chunk_height = chunk_height ? chunk_height : 384;
 	chunk->reinf_entries = 0;
@@ -118,7 +85,10 @@ static u8 *record_get_or_create(gp_chunk_reinf *chunk, u32 x, u32 y, u32 z)
 
 bool gp_chunk_reinf_add(gp_chunk_reinf *chunk, u32 x, u32 y, u32 z, gp_face_t face, u16 amount)
 {
-	if (face >= GP_FACE_COUNT || amount == 0)
+	// Durability is stored in 12 bits. A tier wider than that has to be refused
+	// rather than quietly truncated into the record, which would leave a host
+	// believing it had reinforced a face further than it had.
+	if (face >= GP_FACE_COUNT || amount == 0 || amount > GP_REINF_DURABILITY_MAX)
 		return false;
 
 	// Look for the face before allocating anything, so a refused reapplication
@@ -150,7 +120,7 @@ bool gp_chunk_reinf_add(gp_chunk_reinf *chunk, u32 x, u32 y, u32 z, gp_face_t fa
 				return false;
 
 			state.durability[i] = amount;
-			pack(&state, upgraded);
+			gp_block_reinf_pack(&state, upgraded);
 			return true;
 		}
 	}
@@ -160,6 +130,19 @@ bool gp_chunk_reinf_add(gp_chunk_reinf *chunk, u32 x, u32 y, u32 z, gp_face_t fa
 		// starts from a zeroed state.
 		memset(&state, 0, sizeof(state));
 	}
+
+	/*
+	 * A locked block still takes upgrades: the loop above is where those happen,
+	 * and by the time control gets here the face is one the block does not carry.
+	 * The lock exists to stop a build growing new protected sides, not to stop
+	 * its owner reinforcing the sides they already built.
+	 *
+	 * Refusing here rather than at the top is what keeps those two apart, and it
+	 * also costs the caller nothing: a false return means the host keeps the
+	 * plate it was about to spend.
+	 */
+	if (have && gp_block_reinf_faces_locked(&state))
+		return false;
 
 	u8 *record = record_get_or_create(chunk, x, y, z);
 	if (!record)
@@ -171,12 +154,13 @@ bool gp_chunk_reinf_add(gp_chunk_reinf *chunk, u32 x, u32 y, u32 z, gp_face_t fa
 		if (state.face[i] != GP_FACE_NONE)
 			continue;
 
-		bool was_empty = state.count == 0;
+		bool was_empty = gp_block_reinf_empty(&state);
 
 		state.face[i] = (u8)face;
 		state.durability[i] = amount;
-		state.count++;
-		pack(&state, record);
+		// a stale flag would follow the face onto a slot that no longer has it
+		state.slot_flags[i] = 0;
+		gp_block_reinf_pack(&state, record);
 
 		if (was_empty)
 			chunk->reinf_entries++;
@@ -194,7 +178,7 @@ bool gp_chunk_reinf_face_active(const gp_chunk_reinf *chunk, u32 x, u32 y, u32 z
 		return false;
 
 	gp_block_reinf_t state;
-	unpack(record, &state);
+	gp_block_reinf_unpack(record, &state);
 
 	for (u32 i = 0; i < GP_MAX_REINFORCED_FACES; i++)
 		if (state.face[i] == face)
@@ -209,8 +193,140 @@ bool gp_chunk_reinf_get(const gp_chunk_reinf *chunk, u32 x, u32 y, u32 z, gp_blo
 	if (!record)
 		return false;
 
-	unpack(record, out);
-	return out->count > 0;
+	gp_block_reinf_unpack(record, out);
+	return true;
+}
+
+u8 gp_chunk_reinf_slot_flags(const gp_chunk_reinf *chunk, u32 x, u32 y, u32 z, gp_face_t face)
+{
+	gp_block_reinf_t state;
+	if (!gp_chunk_reinf_get(chunk, x, y, z, &state))
+		return 0;
+
+	int slot = gp_block_reinf_slot(&state, face);
+	return slot < 0 ? 0 : state.slot_flags[slot];
+}
+
+bool gp_chunk_reinf_slot_flags_set(gp_chunk_reinf *chunk, u32 x, u32 y, u32 z, gp_face_t face, u8 flags)
+{
+	if (face >= GP_FACE_COUNT)
+		return false;
+
+	gp_block_reinf_t state;
+	if (!gp_chunk_reinf_get(chunk, x, y, z, &state))
+		return false;
+
+	// Flags describe a face, so they only mean anything on a reinforced one.
+	int slot = gp_block_reinf_slot(&state, face);
+	if (slot < 0)
+		return false;
+
+	if (state.slot_flags[slot] == flags)
+		return true;
+
+	u8 *record = record_get_or_create(chunk, x, y, z);
+	if (!record)
+		return false;
+
+	state.slot_flags[slot] = flags;
+	gp_block_reinf_pack(&state, record);
+	return true;
+}
+
+u8 gp_chunk_reinf_motion_block(const gp_chunk_reinf *chunk, u32 x, u32 y, u32 z)
+{
+	gp_block_reinf_t state;
+	if (!gp_chunk_reinf_get(chunk, x, y, z, &state))
+		return GP_MOTION_BLOCKED_NONE;
+
+	return state.motion_block;
+}
+
+bool gp_chunk_reinf_motion_block_set(gp_chunk_reinf *chunk, u32 x, u32 y, u32 z, u8 blocked)
+{
+	// Only the six real directions exist; ignoring the rest keeps a mask written
+	// from a stale face id out of the record.
+	u8 masked = blocked & GP_MOTION_BLOCKED_ALL;
+
+	gp_block_reinf_t state;
+	if (!gp_chunk_reinf_get(chunk, x, y, z, &state))
+	{
+		if (masked == GP_MOTION_BLOCKED_NONE)
+			return true; // nothing to store, so no record is created either
+
+		memset(&state, 0, sizeof(state));
+	}
+	else if (state.motion_block == masked)
+	{
+		return true;
+	}
+
+	u8 *record = record_get_or_create(chunk, x, y, z);
+	if (!record)
+		return false;
+
+	bool was_empty = gp_block_reinf_empty(&state);
+	state.motion_block = masked;
+	gp_block_reinf_pack(&state, record);
+
+	// Clearing the last thing a record held has to drop it, or the sparse map
+	// keeps paying for a block that nothing constrains any more.
+	if (gp_block_reinf_empty(&state))
+	{
+		gp_sparse_remove(&chunk->reinf, gp_block_index(x, y, z, chunk->chunk_height));
+		if (chunk->reinf_entries > 0)
+			chunk->reinf_entries--;
+	}
+	else if (was_empty)
+	{
+		chunk->reinf_entries++;
+	}
+
+	return true;
+}
+
+u8 gp_chunk_reinf_flags(const gp_chunk_reinf *chunk, u32 x, u32 y, u32 z)
+{
+	gp_block_reinf_t state;
+	if (!gp_chunk_reinf_get(chunk, x, y, z, &state))
+		return GP_BLOCK_FLAG_NONE;
+
+	return state.flags;
+}
+
+bool gp_chunk_reinf_flags_set(gp_chunk_reinf *chunk, u32 x, u32 y, u32 z, u8 flags, u8 mask)
+{
+	// Only the bits the library defines may be written. A mask carrying anything
+	// else would be a host passing a face id or a stale constant.
+	mask &= GP_BLOCK_FLAG_ALL;
+	if (mask == 0)
+		return true;
+
+	gp_block_reinf_t state;
+	if (!gp_chunk_reinf_get(chunk, x, y, z, &state))
+		return false;
+
+	/*
+	 * Both flags describe what the protection on this block means, so neither has
+	 * anything to say about a block with no reinforced face. Refusing rather than
+	 * creating the record is the whole point: gp_block_reinf_empty ignores the
+	 * flags, so a record holding only one of them would never be cleaned up by a
+	 * face running out and would sit in the sparse map forever.
+	 */
+	if (gp_block_reinf_faces(&state) == 0)
+		return false;
+
+	u8 updated = (u8)((state.flags & ~mask) | (flags & mask));
+	if (updated == state.flags)
+		return true;
+
+	u8 *record = record_get_or_create(chunk, x, y, z);
+	if (!record)
+		return false;
+
+	state.flags = updated;
+	gp_block_reinf_pack(&state, record);
+	return true;
 }
 
 bool gp_chunk_reinf_consume(gp_chunk_reinf *chunk, u32 x, u32 y, u32 z, gp_face_t face)
@@ -220,7 +336,7 @@ bool gp_chunk_reinf_consume(gp_chunk_reinf *chunk, u32 x, u32 y, u32 z, gp_face_
 		return false;
 
 	gp_block_reinf_t state;
-	unpack(record, &state);
+	gp_block_reinf_unpack(record, &state);
 
 	for (u32 i = 0; i < GP_MAX_REINFORCED_FACES; i++)
 	{
@@ -234,21 +350,24 @@ bool gp_chunk_reinf_consume(gp_chunk_reinf *chunk, u32 x, u32 y, u32 z, gp_face_
 		{
 			state.face[i] = GP_FACE_NONE;
 			state.durability[i] = 0;
-			state.count--;
-			chunk->reinf_entries--;
+			state.slot_flags[i] = 0;
+
+			// The face is gone, but the record may still be holding a block in
+			// place, in which case the block itself is still worth storing.
+			if (gp_block_reinf_empty(&state))
+			{
+				gp_sparse_remove(&chunk->reinf, gp_block_index(x, y, z, chunk->chunk_height));
+				chunk->reinf_entries--;
+			}
+			else
+			{
+				gp_block_reinf_pack(&state, record);
+			}
+
+			return survived;
 		}
 
-		if (state.count == 0)
-		{
-			// block is fully unprotected now, drop the record so the sparse
-			// table does not keep paying for it
-			gp_sparse_remove(&chunk->reinf, gp_block_index(x, y, z, chunk->chunk_height));
-		}
-		else
-		{
-			pack(&state, record);
-		}
-
+		gp_block_reinf_pack(&state, record);
 		return survived;
 	}
 
@@ -270,19 +389,22 @@ void gp_chunk_reinf_clear(gp_chunk_reinf *chunk, u32 x, u32 y, u32 z)
    Refuses rather than dropping anything when the union would need more than
    GP_MAX_REINFORCED_FACES distinct faces, so a refused merge leaves both records
    untouched. */
-static bool merge_reinf(const gp_block_reinf_t *dest, const gp_block_reinf_t *moved,
-                        gp_block_reinf_t *out)
+static bool merge_reinf(const gp_block_reinf_t *dest, const gp_block_reinf_t *moved, gp_block_reinf_t *out)
 {
-	u8 face[GP_MAX_REINFORCED_FACES] = {GP_FACE_NONE, GP_FACE_NONE, GP_FACE_NONE, GP_FACE_NONE};
-	u16 dur[GP_MAX_REINFORCED_FACES] = {0, 0, 0, 0};
-	u32 occupied = 0;
+	gp_block_reinf_t merged;
+	memset(&merged, 0, sizeof(merged));
 
+	// The destination's faces are laid down first, compacted into the low slots
+	// so there is room to add any of the incoming ones.
+	u32 occupied = 0;
 	for (u32 i = 0; i < GP_MAX_REINFORCED_FACES; i++)
 	{
 		if (dest->face[i] == GP_FACE_NONE)
 			continue;
-		face[occupied] = dest->face[i];
-		dur[occupied] = dest->durability[i];
+
+		merged.face[occupied] = dest->face[i];
+		merged.durability[occupied] = dest->durability[i];
+		merged.slot_flags[occupied] = dest->slot_flags[i];
 		occupied++;
 	}
 
@@ -291,33 +413,45 @@ static bool merge_reinf(const gp_block_reinf_t *dest, const gp_block_reinf_t *mo
 		if (moved->face[i] == GP_FACE_NONE)
 			continue;
 
-		u32 j = 0;
-		for (; j < occupied; j++)
-			if (face[j] == moved->face[i])
-				break;
-
-		if (j < occupied)
+		int at = -1;
+		for (u32 j = 0; j < occupied; j++)
 		{
-			u32 sum = (u32)dur[j] + moved->durability[i];
-			dur[j] = sum > 0xFFFF ? 0xFFFF : (u16)sum;
+			if (merged.face[j] == moved->face[i])
+			{
+				at = (int)j;
+				break;
+			}
+		}
+
+		if (at >= 0)
+		{
+			u32 sum = (u32)merged.durability[at] + moved->durability[i];
+			merged.durability[at] = sum > GP_REINF_DURABILITY_MAX ? GP_REINF_DURABILITY_MAX : (u16)sum;
+			merged.slot_flags[at] |= moved->slot_flags[i];
 			continue;
 		}
 
 		if (occupied >= GP_MAX_REINFORCED_FACES)
 			return false; // would silently drop a distinct face
 
-		face[occupied] = moved->face[i];
-		dur[occupied] = moved->durability[i];
+		merged.face[occupied] = moved->face[i];
+		merged.durability[occupied] = moved->durability[i];
+		merged.slot_flags[occupied] = moved->slot_flags[i];
 		occupied++;
 	}
 
-	out->count = (u8)occupied;
-	for (u32 i = 0; i < GP_MAX_REINFORCED_FACES; i++)
-	{
-		out->face[i] = face[i];
-		out->durability[i] = dur[i];
-	}
+	/* A piston translates a block without rotating it, so the constraint travels
+	   with it. Or rather than overwrite: a block held in place at either end of a
+	   push must not be freed by the other end. */
+	merged.motion_block = dest->motion_block | moved->motion_block;
 
+	/* Same reasoning, and the same reason these are or'd rather than taken from
+	   one side. A lock belongs to the physical block, so it has to follow the block
+	   onto whatever it lands on; piston freedom has to travel with it too, or the
+	   very move the flag allowed would hand the block its protection back. */
+	merged.flags = (u8)(dest->flags | moved->flags);
+
+	*out = merged;
 	return true;
 }
 
@@ -380,7 +514,20 @@ bool gp_chunk_reinf_transfer(gp_chunk_reinf *src, u32 from_x, u32 from_y, u32 fr
 	if (src->reinf_entries > 0)
 		src->reinf_entries--;
 
-	if (merged.count == 0)
+	/*
+	 * The removal above can compact the table when tombstones dominate, and
+	 * compaction reallocates the value array. When the move stays inside one
+	 * chunk that is this very table, so the pointer taken before it may already
+	 * be dangling. Look the cell up again by key rather than trusting it.
+	 */
+	if (src == dst)
+	{
+		record = gp_sparse_get(&dst->reinf, gp_block_index(to_x, to_y, to_z, dst->chunk_height), true);
+		if (!record)
+			return false;
+	}
+
+	if (gp_block_reinf_empty(&merged))
 	{
 		// Nothing left to write. If the destination cell did not exist before,
 		// drop it again rather than leaving a zeroed record behind: the sparse
@@ -394,7 +541,7 @@ bool gp_chunk_reinf_transfer(gp_chunk_reinf *src, u32 from_x, u32 from_y, u32 fr
 
 	// An existing destination cell is rewritten in place and keeps its entry in
 	// the count; only a newly created one needs counting.
-	pack(&merged, record);
+	gp_block_reinf_pack(&merged, record);
 	if (!had_dest)
 		dst->reinf_entries++;
 	return true;
@@ -444,8 +591,8 @@ void gp_chunk_reinf_visit(const gp_chunk_reinf *chunk, gp_reinf_visit_fn fn, voi
 			continue;
 
 		gp_block_reinf_t state;
-		unpack(chunk->reinf.values + (size_t)i * GP_SPARSE_REINF_VALUE_SIZE, &state);
-		if (state.count == 0)
+		gp_block_reinf_unpack(chunk->reinf.values + (size_t)i * GP_REC_BYTES, &state);
+		if (gp_block_reinf_empty(&state))
 			continue;
 
 		u32 x, y, z;

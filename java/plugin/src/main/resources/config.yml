@@ -2,10 +2,34 @@
 #
 # Reinforce the faces of blocks, and place shields that cover an area for a while.
 #
-# All of the numeric values below are passed to the native library at startup and
-# read back afterwards. A value the library clamps is logged as a startup warning
-# rather than silently ignored, so if something here does not behave as written,
-# check the server log first.
+# GriefProt data below is passed to the native library at startup and read back
+# afterwards, so a value the library clamps is logged as a startup warning rather
+# than silently ignored. The plugin-side tunables further down never reach the
+# library and have no such check; if one of them does not behave as written, the
+# comment beside it says what it accepts.
+#
+# --- the face tools -----------------------------------------------------------
+#
+# Three items act on a block face. Right click and hold the tool against the block
+# for brush-hold-ticks; nothing happens on the click itself.
+#
+#   brush + nugget   Reinforces the aimed face. The nugget in the other hand picks
+#                    the tier and is spent; the brush may be in either hand. A
+#                    nugget on its own does nothing.
+#
+#   flint & steel    Stops the block taking reinforcement on any face it does not
+#                    already carry, so a redstone build stays pushable even after
+#                    an accidental plate. Faces it already has still upgrade.
+#                    Needs the block to be protected already.
+#
+#   slime ball       Lets a piston push or pull the block without the usual rules,
+#                    so a reinforced block can still be part of a moving build.
+#                    Needs the block to be protected already, and has to be used
+#                    from a side with no reinforcement on it.
+#
+# Both flags are one way. No item undoes them; the way back is
+# /griefprot admin protection unlock [world] <x> <y> <z>, which clears the flags
+# and leaves the reinforcement alone.
 
 # How many faces of one block may carry reinforcement at once. The underlying
 # record has four slots, so anything above 4 is refused by the library.
@@ -22,12 +46,87 @@ iron-breaks: 256
 copper-tier-points: 32
 iron-tier-points: 256
 
+# How long a face tool has to be held against a block before it does anything.
+#
+# Right click and keep the tool on the block for this long. Nothing happens on the
+# click itself, so a misclick no longer spends a nugget or sets a flag before the
+# player has had a chance to notice what they aimed at.
+#
+# The action bar fills while it runs. It does not stop if the button is released,
+# only if the player looks away, swaps the tool, or starts sneaking -- there is no
+# way to read the mouse from a plugin. 1-200 ticks; 0 is refused because it would
+# put this back to being a plain click.
+brush-hold-ticks: 20
+
 # Materials that may carry reinforcement. Leave empty to allow every solid block.
 protectable-materials: []
 
+# Where a sneaking plate lands. One of same-block, through, off.
+#
+# Normally a plate lands on the face you clicked. Sneaking sends it somewhere
+# the crosshair is not pointing, which is the only way to reach a face that
+# cannot be aimed at.
+#
+#   same-block  the far side of the block you clicked. Stand on a lone block,
+#               sneak, click its top, and the plate lands on the underside
+#               nothing can aim at. This is the default.
+#
+#               It reaches a face only from one you can aim at, so a wall several
+#               blocks tall does not qualify: the brick above the bottom row
+#               covers that row's top face, and the bottom row's underside is
+#               unreachable by any click at all. No setting changes that.
+#   through     past the clicked face, onto the block behind it. The only way to
+#               plate the interior of a wall more than one block thick, since the
+#               faces between two buried blocks cannot be aimed at by anyone.
+#               Refuses when the block behind is air or cannot be reinforced,
+#               which is most of the time in the open.
+#   off         a plate always lands on the face you clicked.
+#
+# Without this, reinforcement can only land on a face you can already see, which
+# makes it track how exposed a block is -- the opposite of what protection wants.
+#
+# Note that shift is also how a player sneaks to avoid falling off a ledge, so a
+# shift-click meant for something else will place a plate. The message always
+# says where it went.
+opposite-side-placement: same-block
+
+# Radius in blocks around the targeted block shown by the reinforcement and
+# shield debug overlays. The supported range is 0-32; 0 shows only the targeted
+# block. Large radii can be expensive, especially with many visible reinforced
+# faces or shielded blocks.
+debug-overlay-radius: 2
+
+# Scales the tool durability spent on a break that protection stopped.
+#
+# Paper does not damage the tool when BlockBreakEvent is cancelled, so without
+# this a reinforced block can be hit for free forever.
+#
+# The base is the held tool's own `damage_per_block`, which at this version is a
+# flat 1 for every vanilla tool: the per-tier speed lives elsewhere in the tool
+# data and never reaches the wear. So this number, not the item, is what the raid
+# actually costs. Unbreaking and Mending still apply on top.
+#
+# The default is 20 because at 1.0 the charge is invisible. Absorbed hits before
+# the tool gives out:
+#
+#   multiplier   wooden (59)   iron (250)   diamond (1561)
+#        1.0            59            250             1561
+#       10.0             6             25              156
+#       20.0             3             12               78   <- default
+#       40.0             2              6               39
+#     0.0            tool wear off entirely
+#
+# The accepted range is 0-100.
+tool-damage-multiplier: 20.0
+
 # Shield blocks.
+# Time settings use game-time seconds (20 server ticks per second), not wall
+# clock time. Low TPS therefore slows shield fuel use, regeneration and decay.
 shield-pool: 4096
-shield-regen-seconds: 20
+# Total points the shield may grant per shield-window-seconds.
+# Older configs may still use shield-regen-seconds; it was never a duration.
+shield-regen-points-per-window: 20
+# Actual game-time duration between grants (20 server ticks = 1 game second).
 shield-window-seconds: 300
 shield-range: 4
 shield-max-targets: 64
@@ -35,7 +134,41 @@ shield-fuel-max: 64
 shield-fuel-per-second: 1
 
 # How many shield points a covering shield hands out per window.
+# A shield must stay powered and fuelled through shield-window-seconds of game
+# time to grant.
 shield-points-per-window: 1
+
+# --- the shield generator ------------------------------------------------------
+#
+# The block a player turns into a shield, and the item that turns it.
+#
+# Place the core block anywhere, then right click it with the activation item.
+# The item is spent and is NOT given back: breaking the generator later drops
+# only what the block itself drops, so the activation item is the one-time cost
+# of having a generator at all.
+#
+# The generator is a real furnace in every other respect. It has the usual three
+# slots, it is fuelled the same way, and it keeps its contents when the chunk
+# unloads. Two of its slots behave differently:
+#
+#   fuel     Put a supported fuel in here. It is taken out of the slot and
+#            turned into shield fuel, and the shield runs until it is spent.
+#            A lava bucket leaves an empty bucket behind, as it would. Unknown
+#            fuels are left in the slot and refused.
+#   input    Refused. A shield generator does not smelt, so the input slot takes
+#            nothing. Use it for storage at your own risk.
+#
+# An item is worth the number of furnace seconds it would have burned for, so a
+# coal is 80 and a blaze rod 120, and the shield drains
+# shield-fuel-per-second per game second. Unsupported and unfamiliar fuels are
+# refused until griefprot explicitly assigns them a burn time.
+#
+# shield-fuel-max does not cap a generator. It is what a shield created with
+# /griefprot admin shield create starts with; a generator holds exactly what has
+# been put into it, because a fuel slot that silently refuses a coal it could
+# have run on for 80 game seconds is worse than a long-lasting generator.
+shield-core-material: BLAST_FURNACE
+shield-core-activation-item: NETHER_STAR
 
 # Shield points on a block that no shield is covering decay away after this long.
 # Set it comfortably above the longest gap between shield windows, or protection

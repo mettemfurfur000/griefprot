@@ -1,6 +1,7 @@
 package com.tem.griefprot.config;
 
 import java.util.List;
+import org.bukkit.Material;
 
 /**
  * Tunables for the plugin, read once at startup.
@@ -11,13 +12,13 @@ import java.util.List;
  *
  * @param maxFacesPerBlock how many faces may carry reinforcement at once
  * @param shieldPool how many shields one dimension may hold
- * @param shieldRegen seconds between shield regeneration grants
- * @param shieldWindow seconds a shield protects before it must recharge
+ * @param shieldRegenPointsPerWindow total points the shield may grant each window
+ * @param shieldWindow game seconds a shield protects before it must recharge
  * @param shieldRange radius in blocks a shield reaches
  * @param shieldMaxTargets how many blocks one shield may cover
  * @param shieldFuelMax fuel a full shield holds
- * @param shieldFuelPerSec fuel burned per second while running
- * @param decayInterval seconds before an uncovered record decays
+ * @param shieldFuelPerSec fuel units burned per game second while running
+ * @param decayInterval game seconds before an uncovered record decays
  * @param decayAmount how much one decay sweep removes
  * @param copperBreaks break events the copper tier absorbs
  * @param ironBreaks break events the iron tier absorbs
@@ -25,11 +26,17 @@ import java.util.List;
  * @param protectableMaterials materials players may reinforce, empty for all solid
  * @param copperTierPoints reinforcement value granted by one copper plate
  * @param ironTierPoints reinforcement value granted by one iron plate
+ * @param debugOverlayRadius block radius rendered by the reinforcement debug overlay
+ * @param toolDamageMultiplier scales the tool durability an absorbed break costs
+ * @param oppositeSide where a sneaking plate lands, see {@link OppositeSide}
+ * @param brushHoldTicks how long a face tool must be held before it takes effect
+ * @param shieldCoreMaterial the block a player turns into a shield generator
+ * @param shieldCoreActivationItem the item that turns it
  */
 public record PluginConfig(
         int maxFacesPerBlock,
         int shieldPool,
-        int shieldRegen,
+        int shieldRegenPointsPerWindow,
         int shieldWindow,
         int shieldRange,
         int shieldMaxTargets,
@@ -42,4 +49,10 @@ public record PluginConfig(
         int shieldPointsPerWindow,
         List<String> protectableMaterials,
         int copperTierPoints,
-        int ironTierPoints) {}
+        int ironTierPoints,
+        int debugOverlayRadius,
+        double toolDamageMultiplier,
+        OppositeSide oppositeSide,
+        int brushHoldTicks,
+        Material shieldCoreMaterial,
+        Material shieldCoreActivationItem) {}

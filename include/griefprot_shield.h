@@ -73,8 +73,9 @@ typedef struct
 	bool powered;
 	bool running;
 
-	u64 window_start; // timestamp of the current window
-bool started; // has ticked at least once, so window_start is meaningful
+	u64 window_start; // start of the current regeneration window
+	u64 last_tick;    // timestamp used to account for fuel consumption
+	bool started;     // has ticked at least once, so both timestamps are meaningful
 } gp_shield;
 
 /* Allocates a shield. `capacity` bounds the target list; pass cfg->shield_max_targets.
@@ -98,6 +99,8 @@ u32 gp_shield_merge_targets(gp_shield *dst, const gp_shield *src);
 
 void gp_shield_set_fuel(gp_shield *shield, u32 fuel);
 void gp_shield_set_powered(gp_shield *shield, bool powered);
+/* Applies the world's current tuning while preserving fuel, power and targets. */
+void gp_shield_apply_config(gp_shield *shield, const gp_config *cfg);
 
 /* Advances the shield to `now`, spending at most one window's worth of budget.
    `points_granted` may be NULL. Returns the points granted this call. */

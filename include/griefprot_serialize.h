@@ -17,17 +17,41 @@ extern "C" {
 /* On-disk format version. Bumped whenever a record layout changes so old data
    is detected instead of misread.
  *
- * Version 2: the per-block shield record grew from 8 to 12 bytes to carry a
- * coverage expiry alongside its point count. Version 1 files are rejected rather
- * than migrated, because a coverage claim cannot be reconstructed from data
- * written before coverage existed, and silently reading those blocks as
- * uncovered would bleed every shield the first time decay ran. */
-#define GP_FORMAT_VERSION 2
+ * Version 4: the per block reinforcement record gained a two bit flags field,
+ * holding the face lock and the piston freedom a host sets on a block. The record
+ * is still 10 bytes, so this is the case the bump exists for: v3 files read as v4
+ * would decode the two highest bits of the record as flags nobody ever set, and
+ * every one of those blocks would come back both face locked and piston free.
+ * Version 3 files are rejected rather than migrated, same as v1 and v2.
+ *
+ * Version 3: the per block reinforcement record is now derived from the field
+ * list in griefprot_record.h. Durability dropped from 16 to 12 bits, the
+ * redundant slot counter is gone, and per slot flags plus a physics constraint
+ * mask took its place. Version 2 files are rejected rather than migrated: the
+ * record is the same 10 bytes but the bits inside it are in different places, so
+ * a v2 file read as v3 would give every block the wrong faces, the wrong
+ * durability, and constraints that were never set.
+ *
+ * Version 2 grew the per block shield record from 8 to 12 bytes to carry a
+ * coverage expiry. Version 1 predates coverage claims entirely and is rejected
+ * for the same reason: a claim cannot be reconstructed from data written before
+ * coverage existed. */
+#define GP_FORMAT_VERSION 4
+
+/* Bytes one serialized reinforcement record takes: a u32 block index followed by
+   one packed block record. Derived, so widening a field cannot silently push the
+   group below without anything noticing. */
+#define GP_REINF_REC_SIZE (sizeof(u32) + GP_REC_BYTES)
 
 /* temlib's tkv_object_add_field writes values through an 8192 byte stack buffer,
    so a single array field can never exceed that. Records are therefore split
-   across numbered groups. 512 * 14 bytes leaves comfortable headroom. */
-#define GP_RECORDS_PER_GROUP 512
+   across numbered groups, and the number per group is derived from the record
+   size rather than fixed: a format change that widens a record would otherwise
+   overflow that buffer rather than just spilling into another group. */
+#define GP_TKV_FIELD_BYTES 8192u
+#define GP_TKV_FIELD_SLACK 128u
+
+#define GP_REINF_RECORDS_PER_GROUP ((GP_TKV_FIELD_BYTES - GP_TKV_FIELD_SLACK) / GP_REINF_REC_SIZE)
 
 /* Largest block index representable, given a 16 x H x 16 chunk with a sane H. */
 #define GP_MAX_BLOCK_INDEX 0xFFFFFFFBu

@@ -106,6 +106,87 @@ class AbiTest {
         assertFalse(abi.chunkAt(0, 0, 64, 0));
         assertEquals(0, abi.pointsGet(0, 0, 64, 0));
         assertEquals(Abi.NO_FACE, abi.weakestFace(0, 0, 64, 0));
+        assertEquals(0, abi.reinfFlags(0, 0, 64, 0));
+        assertFalse(abi.reinfFlagsSet(0, 0, 64, 0, abi.blockFlagLockFaces(), abi.blockFlagLockFaces()));
+        assertFalse(abi.reinfFacesLocked(0, 0, 64, 0));
+        assertFalse(abi.reinfPistonFree(0, 0, 64, 0));
+    }
+
+    @Test
+    @DisplayName("block flag bits are distinct and both live in the all-flags mask")
+    void blockFlagBitsAreDistinct() {
+        int lock = abi.blockFlagLockFaces();
+        int free = abi.blockFlagPistonFree();
+
+        assertNotEquals(0, lock, "a flag of zero can never be set");
+        assertNotEquals(0, free, "a flag of zero can never be set");
+        assertNotEquals(lock, free, "the two flags are the same bit");
+        assertEquals(lock | free, abi.blockFlagAll());
+    }
+
+    @Test
+    @DisplayName("a lock stops new faces but not upgrades to the ones already there")
+    void lockRefusesNewFacesAndAllowsUpgrades() {
+        int w = newWorld();
+        abi.chunkAt(w, 0, 64, 0);
+        assertTrue(abi.reinfAdd(w, 0, 64, 0, abi.faceNorth(), 8));
+
+        int lock = abi.blockFlagLockFaces();
+        assertTrue(abi.reinfFlagsSet(w, 0, 64, 0, lock, lock));
+        assertTrue(abi.reinfFacesLocked(w, 0, 64, 0));
+        assertEquals(lock, abi.reinfFlags(w, 0, 64, 0));
+
+        assertFalse(abi.reinfAdd(w, 0, 64, 0, abi.faceUp(), 8), "a new face is refused");
+        assertEquals(0, abi.reinfFaceDurability(w, 0, 64, 0, abi.faceUp()));
+        assertTrue(abi.reinfAdd(w, 0, 64, 0, abi.faceNorth(), 32), "an upgrade still goes on");
+        assertEquals(32, abi.reinfFaceDurability(w, 0, 64, 0, abi.faceNorth()));
+        assertEquals(1, abi.reinfFaceCount(w, 0, 64, 0), "the refusal opened no second slot");
+    }
+
+    @Test
+    @DisplayName("a flag needs a protected block to describe, and never allocates one")
+    void flagsNeedReinforcementToExist() {
+        int w = newWorld();
+
+        assertFalse(abi.reinfFlagsSet(w, 0, 64, 0, abi.blockFlagPistonFree(), abi.blockFlagPistonFree()));
+        assertEquals(0, abi.reinfFlags(w, 0, 64, 0));
+        assertFalse(abi.chunkIsLoaded(w, 0, 0), "a refused flag must not load a chunk");
+    }
+
+    @Test
+    @DisplayName("a mask sets one flag without touching the other")
+    void maskSelectsWhichFlagIsWritten() {
+        int w = newWorld();
+        abi.chunkAt(w, 0, 64, 0);
+        abi.reinfAdd(w, 0, 64, 0, abi.faceUp(), 8);
+
+        assertTrue(abi.reinfFlagsSet(w, 0, 64, 0, abi.blockFlagPistonFree(), abi.blockFlagPistonFree()));
+        assertTrue(abi.reinfPistonFree(w, 0, 64, 0));
+        assertFalse(abi.reinfFacesLocked(w, 0, 64, 0));
+
+        assertTrue(abi.reinfFlagsSet(w, 0, 64, 0, abi.blockFlagLockFaces(), abi.blockFlagLockFaces()));
+        assertEquals(abi.blockFlagAll(), abi.reinfFlags(w, 0, 64, 0));
+
+        // Clearing all of them is the admin undo, and it must leave the faces be.
+        assertTrue(abi.reinfFlagsSet(w, 0, 64, 0, 0, abi.blockFlagAll()));
+        assertEquals(0, abi.reinfFlags(w, 0, 64, 0));
+        assertEquals(8, abi.reinfFaceDurability(w, 0, 64, 0, abi.faceUp()));
+        assertTrue(abi.reinfAdd(w, 0, 64, 0, abi.faceNorth(), 8));
+    }
+
+    @Test
+    @DisplayName("flags travel with a block a piston moves")
+    void flagsFollowTheBlock() {
+        int w = newWorld();
+        abi.chunkAt(w, 0, 64, 0);
+        abi.reinfAdd(w, 1, 64, 0, abi.faceUp(), 8);
+        abi.reinfFlagsSet(w, 1, 64, 0, abi.blockFlagAll(), abi.blockFlagAll());
+
+        assertTrue(abi.moveBlock(w, 1, 64, 0, 2, 64, 0, abi.faceEast()));
+
+        assertEquals(abi.blockFlagAll(), abi.reinfFlags(w, 2, 64, 0));
+        assertTrue(abi.reinfPistonFree(w, 2, 64, 0), "the exemption must not die at the old coordinates");
+        assertEquals(0, abi.reinfFlags(w, 1, 64, 0));
     }
 
     @Test
@@ -181,6 +262,26 @@ class AbiTest {
         // Zero is always refused.
         assertFalse(abi.reinfAdd(w, 0, 64, 0, abi.faceDown(), 0));
         assertFalse(abi.reinfFaceActive(w, 0, 64, 0, abi.faceDown()));
+    }
+
+    @Test
+    @DisplayName("the durability ceiling comes from the record, not from the shim")
+    void durabilityCeilingIsReportedAndEnforced() {
+        int w = newWorld();
+        abi.chunkAt(w, 0, 64, 0);
+
+        int ceiling = abi.reinfDurabilityMax();
+        assertEquals(4095, ceiling);
+
+        // Exactly at the ceiling is fine, one past it is refused rather than
+        // truncated, so a host can never believe it reinforced a face further
+        // than the record can hold.
+        assertTrue(abi.reinfAdd(w, 0, 64, 0, abi.faceUp(), ceiling));
+        assertEquals(ceiling, abi.reinfFaceDurability(w, 0, 64, 0, abi.faceUp()));
+
+        assertFalse(abi.reinfAdd(w, 0, 64, 0, abi.faceNorth(), ceiling + 1));
+        assertFalse(abi.reinfFaceActive(w, 0, 64, 0, abi.faceNorth()));
+        assertEquals(1, abi.reinfFaceCount(w, 0, 64, 0));
     }
 
     @Test

@@ -1,8 +1,12 @@
 #include "griefprot_serialize.h"
 #include <string.h>
 
-#define GP_REINF_REC_SIZE (sizeof(u32) + GP_SPARSE_REINF_VALUE_SIZE) // 14
-#define GP_SHIELD_REC_SIZE (sizeof(u32) * 3)                         // index + points + coverage
+#define GP_SHIELD_REC_SIZE (sizeof(u32) * 3) // index + points + coverage
+
+/* Derived from the record size for the same reason as GP_REINF_RECORDS_PER_GROUP:
+   a shield record that grows must spill into another group rather than overflow
+   temlib's field buffer. */
+#define GP_SHIELD_RECORDS_PER_GROUP ((GP_TKV_FIELD_BYTES - GP_TKV_FIELD_SLACK) / GP_SHIELD_REC_SIZE)
 
 /* TKV reads scalars back through stream_read, which converts sizes below 9
    bytes, but array payloads are copied verbatim. Everything multi byte inside a
@@ -137,7 +141,7 @@ tkv_object gp_chunk_pack(const gp_chunk_reinf *chunk, arena *out)
 	if (!GP_ADD(obj, "nsd", TKV_VALUE_U32, &nsd, out))
 		return NULL;
 
-	u8 buf[GP_RECORDS_PER_GROUP * GP_REINF_REC_SIZE];
+	u8 buf[GP_REINF_RECORDS_PER_GROUP * GP_REINF_REC_SIZE];
 	u16 count = 0;
 	u32 group = 0;
 
@@ -151,10 +155,9 @@ tkv_object gp_chunk_pack(const gp_chunk_reinf *chunk, arena *out)
 
 		u8 *slot = buf + (u32)count * GP_REINF_REC_SIZE;
 		put_u32(slot, key);
-		memcpy(slot + sizeof(u32), chunk->reinf.values + (size_t)i * GP_SPARSE_REINF_VALUE_SIZE,
-		       GP_SPARSE_REINF_VALUE_SIZE);
+		memcpy(slot + sizeof(u32), chunk->reinf.values + (size_t)i * GP_REC_BYTES, GP_REC_BYTES);
 
-		if (++count < GP_RECORDS_PER_GROUP)
+		if (++count < GP_REINF_RECORDS_PER_GROUP)
 			continue;
 
 		char key_name[8];
@@ -174,7 +177,7 @@ tkv_object gp_chunk_pack(const gp_chunk_reinf *chunk, arena *out)
 			return NULL;
 	}
 
-	u8 sbuf[GP_RECORDS_PER_GROUP * GP_SHIELD_REC_SIZE];
+	u8 sbuf[GP_SHIELD_RECORDS_PER_GROUP * GP_SHIELD_REC_SIZE];
 	count = 0;
 	group = 0;
 
@@ -190,7 +193,7 @@ tkv_object gp_chunk_pack(const gp_chunk_reinf *chunk, arena *out)
 		put_u32(slot + sizeof(u32), get_u32(chunk->shield.values + (size_t)i * sizeof(u32) * 2));
 		put_u32(slot + sizeof(u32) * 2, get_u32(chunk->shield.values + (size_t)i * sizeof(u32) * 2 + sizeof(u32)));
 
-		if (++count < GP_RECORDS_PER_GROUP)
+		if (++count < GP_SHIELD_RECORDS_PER_GROUP)
 			continue;
 
 		char key_name[8];
@@ -268,7 +271,7 @@ bool gp_chunk_unpack(tkv_object obj, gp_chunk_reinf *chunk)
 	gp_chunk_reinf_init(chunk, height);
 	chunk->next_decay = ndc;
 
-	for (u32 group = 0; group * GP_RECORDS_PER_GROUP < nrg; group++)
+	for (u32 group = 0; group * GP_REINF_RECORDS_PER_GROUP < nrg; group++)
 	{
 		char key_name[8];
 		snprintf(key_name, sizeof(key_name), "r%u", group);
@@ -294,7 +297,7 @@ bool gp_chunk_unpack(tkv_object obj, gp_chunk_reinf *chunk)
 
 			u32 live_before = chunk->reinf.count;
 			u8 *rec = gp_sparse_get(&chunk->reinf, index, true);
-			memcpy(rec, slot + sizeof(u32), GP_SPARSE_REINF_VALUE_SIZE);
+			memcpy(rec, slot + sizeof(u32), GP_REC_BYTES);
 
 			// the chunk counters live outside the sparse map and are normally
 			// maintained by gp_chunk_reinf_add, so track them here
@@ -303,7 +306,7 @@ bool gp_chunk_unpack(tkv_object obj, gp_chunk_reinf *chunk)
 		}
 	}
 
-	for (u32 group = 0; group * GP_RECORDS_PER_GROUP < nsd; group++)
+	for (u32 group = 0; group * GP_SHIELD_RECORDS_PER_GROUP < nsd; group++)
 	{
 		char key_name[8];
 		snprintf(key_name, sizeof(key_name), "s%u", group);
@@ -733,9 +736,12 @@ u64 gp_chunk_packed_size(const gp_chunk_reinf *chunk)
 	if (!chunk)
 		return 0;
 
-	u64 reinf_groups = (chunk->reinf.count + GP_RECORDS_PER_GROUP - 1) / GP_RECORDS_PER_GROUP;
-	u64 shield_groups = (chunk->shield.count + GP_RECORDS_PER_GROUP - 1) / GP_RECORDS_PER_GROUP;
+	u64 reinf_groups =
+	    (chunk->reinf.count + GP_REINF_RECORDS_PER_GROUP - 1) / GP_REINF_RECORDS_PER_GROUP;
+	u64 shield_groups =
+	    (chunk->shield.count + GP_SHIELD_RECORDS_PER_GROUP - 1) / GP_SHIELD_RECORDS_PER_GROUP;
 
-	return sizeof(u32) + 5 * 16 /* metadata */ + reinf_groups * (12 + GP_RECORDS_PER_GROUP * GP_REINF_REC_SIZE) +
-	       shield_groups * (12 + GP_RECORDS_PER_GROUP * GP_SHIELD_REC_SIZE);
+	return sizeof(u32) + 5 * 16 /* metadata */ +
+	       reinf_groups * (12 + GP_REINF_RECORDS_PER_GROUP * GP_REINF_REC_SIZE) +
+	       shield_groups * (12 + GP_SHIELD_RECORDS_PER_GROUP * GP_SHIELD_REC_SIZE);
 }

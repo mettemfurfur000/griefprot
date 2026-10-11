@@ -107,6 +107,10 @@ static void test_bad_handles(void)
 	CHECK(gp_abi_chunk_unload(0, 0, 0) == 0);
 	CHECK(gp_abi_reinf_add(0, 0, 64, 0, gp_abi_face_up(), 5) == 0);
 	CHECK(gp_abi_reinf_face_durability(0, 0, 64, 0, gp_abi_face_up()) == 0);
+	CHECK(gp_abi_reinf_flags(0, 0, 64, 0) == 0);
+	CHECK(gp_abi_reinf_flags_set(0, 0, 64, 0, 1, 1) == 0);
+	CHECK(gp_abi_reinf_faces_locked(0, 0, 64, 0) == 0);
+	CHECK(gp_abi_reinf_piston_free(0, 0, 64, 0) == 0);
 	CHECK(gp_abi_weakest_face(0, 0, 64, 0) == GP_ABI_NO_FACE);
 	CHECK(gp_abi_points_get(0, 0, 64, 0) == 0);
 	CHECK(gp_abi_points_add(0, 0, 64, 0, 5, 0) == 0);
@@ -274,6 +278,63 @@ static void test_weakest_face_policy(void)
 	gp_abi_world_destroy(w);
 }
 
+/* The face lock is enforced by the library, so the shim's whole job is to reach
+   it and refuse honestly. A host that could not tell a locked block from a full
+   one would have no way to explain the refusal to the player. */
+static void test_block_flags(void)
+{
+	CHECK(gp_abi_block_flag_lock_faces() != 0);
+	CHECK(gp_abi_block_flag_piston_free() != 0);
+	CHECK(gp_abi_block_flag_lock_faces() != gp_abi_block_flag_piston_free());
+	CHECK((gp_abi_block_flag_all() & gp_abi_block_flag_lock_faces()) != 0);
+	CHECK((gp_abi_block_flag_all() & gp_abi_block_flag_piston_free()) != 0);
+
+	gp_h_world w = gp_abi_world_create();
+	gp_abi_world_config(w, GP_ABI_KEEP, GP_ABI_KEEP, GP_ABI_KEEP, GP_ABI_KEEP, GP_ABI_KEEP,
+	                    GP_ABI_KEEP, GP_ABI_KEEP, GP_ABI_KEEP, GP_ABI_KEEP, GP_ABI_KEEP, GP_ABI_KEEP,
+	                    GP_ABI_KEEP, GP_ABI_KEEP);
+
+	uint32_t lock = gp_abi_block_flag_lock_faces();
+	uint32_t free_move = gp_abi_block_flag_piston_free();
+
+	CHECK(gp_abi_reinf_flags(w, 1, 64, 1) == 0);
+	CHECK(gp_abi_reinf_faces_locked(w, 1, 64, 1) == 0);
+	CHECK(gp_abi_reinf_piston_free(w, 1, 64, 1) == 0);
+
+	// refused on a block with nothing to describe, and refused before the chunk
+	// is touched, so an ignored flag never allocates one
+	CHECK(gp_abi_reinf_flags_set(w, 1, 64, 1, lock, lock) == 0);
+	uint32_t loaded = 1, reserved = 1;
+	gp_abi_chunk_counts(w, &loaded, &reserved);
+	CHECK(loaded == 0);
+
+	CHECK(gp_abi_reinf_add(w, 1, 64, 1, gp_abi_face_north(), 40) == 1);
+	CHECK(gp_abi_reinf_flags_set(w, 1, 64, 1, lock, lock) == 1);
+	CHECK(gp_abi_reinf_flags(w, 1, 64, 1) == lock);
+	CHECK(gp_abi_reinf_faces_locked(w, 1, 64, 1) == 1);
+	CHECK(gp_abi_reinf_piston_free(w, 1, 64, 1) == 0);
+
+	// a new face is refused, an upgrade is not
+	CHECK(gp_abi_reinf_add(w, 1, 64, 1, gp_abi_face_up(), 40) == 0);
+	CHECK(gp_abi_reinf_face_durability(w, 1, 64, 1, gp_abi_face_up()) == 0);
+	CHECK(gp_abi_reinf_add(w, 1, 64, 1, gp_abi_face_north(), 300) == 1);
+
+	// a mask selects which bits are written, and bits the library does not define
+	// are dropped from both the value and the mask rather than reaching the record
+	CHECK(gp_abi_reinf_flags_set(w, 1, 64, 1, free_move, free_move) == 1);
+	CHECK(gp_abi_reinf_flags(w, 1, 64, 1) == (lock | free_move));
+	CHECK(gp_abi_reinf_flags_set(w, 1, 64, 1, 0xFFFFFFFFu, 0xFFFFFFFFu) == 1);
+	CHECK(gp_abi_reinf_flags(w, 1, 64, 1) == gp_abi_block_flag_all());
+	CHECK(gp_abi_reinf_piston_free(w, 1, 64, 1) == 1);
+
+	// clearing, which is how a host takes a lock back off a block it set by mistake
+	CHECK(gp_abi_reinf_flags_set(w, 1, 64, 1, 0, gp_abi_block_flag_all()) == 1);
+	CHECK(gp_abi_reinf_flags(w, 1, 64, 1) == 0);
+	CHECK(gp_abi_reinf_add(w, 1, 64, 1, gp_abi_face_up(), 40) == 1);
+
+	gp_abi_world_destroy(w);
+}
+
 static void test_movement(void)
 {
 	gp_h_world w = gp_abi_world_create();
@@ -431,6 +492,41 @@ static void test_sink_and_shields(void)
 	CHECK(gp_abi_shield_count(w) == 0);
 	CHECK(gp_abi_shield_at(w, 0) == 0);
 
+	gp_abi_world_destroy(w);
+}
+
+static void test_live_shields_follow_world_config(void)
+{
+	gp_h_world w = gp_abi_world_create();
+	gp_abi_world_config(w, 4, 4096, 20, 300, 4, 64, 1000, 1, 300, 1, 384, 32, 256);
+	CHECK(w != 0);
+	g_grant_world = w;
+	g_reject_x = -999;
+	CHECK(gp_abi_sink_configure(w, 0xABCD, (uint64_t)(uintptr_t)&host_protectable,
+	                            (uint64_t)(uintptr_t)&host_grant, (uint64_t)(uintptr_t)&host_cover) == 1);
+
+	gp_h_shield shield = gp_abi_shield_create(w, 10, 64, 10);
+	CHECK(shield != 0);
+	CHECK(gp_abi_shield_add_target(shield, 11, 64, 10) == 1);
+	gp_abi_shield_set_fuel(shield, 1000);
+	gp_abi_shield_set_powered(shield, 1);
+
+	uint32_t granted = 0;
+	CHECK(gp_abi_shield_tick(shield, 100, &granted) == 0);
+	CHECK(gp_abi_shield_tick(shield, 101, &granted) == 0);
+	CHECK(gp_abi_points_get(w, 11, 64, 10) == 0);
+
+	/* A host config change reaches already-created shields without resetting
+	   their fuel or targets. */
+	gp_abi_world_config(w, 4, 100, 3, 2, 4, 64, 1000, 1, 300, 1, 384, 32, 256);
+	CHECK(gp_abi_shield_tick(shield, 102, &granted) == 3);
+	CHECK(gp_abi_points_get(w, 11, 64, 10) == 3);
+
+	uint32_t fuel = 0;
+	gp_abi_shield_get_state(shield, NULL, NULL, &fuel);
+	CHECK(fuel == 998);
+
+	g_grant_world = 0;
 	gp_abi_world_destroy(w);
 }
 
@@ -645,9 +741,11 @@ int main(void)
 	test_config_partial_update();
 	test_reinforcement_and_break();
 	test_weakest_face_policy();
+	test_block_flags();
 	test_movement();
 	test_chunk_lifecycle();
 	test_sink_and_shields();
+	test_live_shields_follow_world_config();
 	test_sink_unconfigured_is_safe();
 	test_coverage_decay();
 	test_persistence();

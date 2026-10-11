@@ -26,7 +26,7 @@ static void test_reinf_basics(void)
 
 	gp_block_reinf_t state;
 	CHECK(gp_chunk_reinf_get(&chunk, 3, 64, 5, &state));
-	CHECK(state.count == 1);
+	CHECK(gp_block_reinf_faces(&state) == 1);
 	CHECK(state.face[0] == GP_FACE_NORTH);
 	CHECK(state.durability[0] == 32);
 
@@ -57,14 +57,14 @@ static void test_reinf_slot_cap(void)
 
 	gp_block_reinf_t state;
 	CHECK(gp_chunk_reinf_get(&chunk, 0, 0, 0, &state));
-	CHECK(state.count == 4);
+	CHECK(gp_block_reinf_faces(&state) == 4);
 	CHECK(state.durability[0] == 256);
 
 	// a refused reapplication must not consume a slot or change anything
 	CHECK(!gp_chunk_reinf_add(&chunk, 0, 0, 0, GP_FACE_NORTH, 32));
 	CHECK(!gp_chunk_reinf_add(&chunk, 0, 0, 0, GP_FACE_NORTH, 256)); // equal is refused too
 	CHECK(gp_chunk_reinf_get(&chunk, 0, 0, 0, &state));
-	CHECK(state.count == 4);
+	CHECK(gp_block_reinf_faces(&state) == 4);
 	CHECK(state.durability[0] == 256);
 
 	// zero is not a tier value and is refused
@@ -116,7 +116,7 @@ static void test_reinf_faces_are_independent(void)
 	// north is gone, south must be untouched
 	gp_block_reinf_t state;
 	CHECK(gp_chunk_reinf_get(&chunk, 5, 5, 5, &state));
-	CHECK(state.count == 1);
+	CHECK(gp_block_reinf_faces(&state) == 1);
 
 	u32 south = 0;
 	for (u32 i = 0; i < GP_MAX_REINFORCED_FACES; i++)
@@ -140,7 +140,7 @@ static void test_reinf_move(void)
 	gp_block_reinf_t state;
 	CHECK(!gp_chunk_reinf_get(&chunk, 2, 64, 2, &state));
 	CHECK(gp_chunk_reinf_get(&chunk, 3, 64, 3, &state));
-	CHECK(state.count == 2);
+	CHECK(gp_block_reinf_faces(&state) == 2);
 	CHECK(state.durability[0] == 32);
 	CHECK(state.durability[1] == 64);
 
@@ -151,7 +151,7 @@ static void test_reinf_move(void)
 	CHECK(gp_chunk_reinf_move(&chunk, 3, 64, 3, 4, 64, 4));
 
 	CHECK(gp_chunk_reinf_get(&chunk, 4, 64, 4, &state));
-	CHECK(state.count == 3);
+	CHECK(gp_block_reinf_faces(&state) == 3);
 
 	u32 north = 0, up = 0, down = 0;
 	for (u32 i = 0; i < GP_MAX_REINFORCED_FACES; i++)
@@ -486,6 +486,7 @@ static void test_shield_fuel_and_power(void)
 {
 	gp_config cfg;
 	gp_config_defaults(&cfg);
+	cfg.shield_window = 1;
 
 	fake_world w;
 	fake_fill(&w, 3);
@@ -523,6 +524,38 @@ static void test_shield_fuel_and_power(void)
 	CHECK(granted == 0);
 	CHECK(!s->running);
 	CHECK(s->fuel == kept); // idle shields do not burn fuel
+
+	gp_shield_destroy(s);
+}
+
+static void test_shield_waits_for_regeneration_window(void)
+{
+	gp_config cfg;
+	gp_config_defaults(&cfg);
+	cfg.shield_window = 5;
+
+	fake_world w;
+	fake_fill(&w, 1);
+
+	gp_shield *s = gp_shield_create(&cfg, (gp_pos){9, 0, 0}, 64);
+	CHECK(s != NULL);
+	CHECK(gp_shield_add_target(s, (gp_pos){0, 0, 0}));
+
+	gp_shield_sink sink = fake_sink(&w);
+	u32 granted = 0;
+	gp_shield_set_powered(s, true);
+	gp_shield_set_fuel(s, 100);
+
+	CHECK(gp_shield_tick(s, 10, &sink, &granted) == 0); // anchor both clocks
+	CHECK(granted == 0);
+	CHECK(gp_shield_tick(s, 14, &sink, &granted) == 0); // inside the window
+	CHECK(granted == 0);
+	CHECK(s->fuel == 96); // fuel still burns while the shield waits to regenerate
+	CHECK(gp_shield_tick(s, 15, &sink, &granted) == cfg.shield_regen);
+	CHECK(granted == cfg.shield_regen);
+	CHECK(w.points[0] == cfg.shield_regen);
+	CHECK(gp_shield_tick(s, 16, &sink, &granted) == 0);
+	CHECK(granted == 0); // one regeneration window grants only once
 
 	gp_shield_destroy(s);
 }
@@ -808,20 +841,21 @@ static void test_chunk_pack_roundtrip(void)
 	CHECK(dst.reinf_entries == src.reinf_entries);
 	CHECK(dst.shield_entries == src.shield_entries);
 
-	/* Compares the meaningful fields rather than the struct bytes, since the
-	   packed record does not round trip padding or the slot count. */
+	/* Compares the meaningful fields rather than the struct bytes, since the packed
+   record round trips through a bit layout that is not the struct's own. */
 	gp_block_reinf_t before, after;
 	const u32 probes[][3] = {{0, 0, 0}, {15, 383, 15}, {8, 100, 3}};
 	for (size_t p = 0; p < sizeof(probes) / sizeof(probes[0]); p++)
 	{
 		CHECK(gp_chunk_reinf_get(&src, probes[p][0], probes[p][1], probes[p][2], &before));
 		CHECK(gp_chunk_reinf_get(&dst, probes[p][0], probes[p][1], probes[p][2], &after));
-		CHECK(before.count == after.count);
+		CHECK(gp_block_reinf_faces(&before) == gp_block_reinf_faces(&after));
 		for (u8 s = 0; s < GP_MAX_REINFORCED_FACES; s++)
 		{
 			CHECK(before.face[s] == after.face[s]);
 			CHECK(before.durability[s] == after.durability[s]);
 		}
+		CHECK(before.motion_block == after.motion_block);
 	}
 
 	CHECK(gp_chunk_shield_get(&src, 0, 0, 0) == 90);
@@ -844,7 +878,7 @@ static void test_chunk_pack_group_spill(void)
 	gp_chunk_reinf src, dst;
 	gp_chunk_reinf_init(&src, 384);
 
-	const u32 total = GP_RECORDS_PER_GROUP + 200;
+	const u32 total = GP_REINF_RECORDS_PER_GROUP + 200;
 	for (u32 i = 0; i < total; i++)
 		gp_chunk_reinf_add(&src, i % 16, i / 256, (i / 16) % 16, GP_FACE_NORTH, (u16)(i % 251 + 1));
 
@@ -1069,24 +1103,24 @@ static void test_reinf_move_refuses_overflow(void)
 
 	gp_block_reinf_t state;
 	CHECK(gp_chunk_reinf_get(&chunk, 1, 64, 0, &state));
-	CHECK(state.count == 4);
+	CHECK(gp_block_reinf_faces(&state) == 4);
 
 	// the source would bring a fifth distinct face
 	CHECK(!gp_chunk_reinf_move(&chunk, 0, 64, 0, 1, 64, 0));
 
 	// nothing moved: the source is intact and so is the destination
 	CHECK(gp_chunk_reinf_get(&chunk, 0, 64, 0, &state));
-	CHECK(state.count == 1);
+	CHECK(gp_block_reinf_faces(&state) == 1);
 	CHECK(state.durability[0] == 10);
 	CHECK(gp_chunk_reinf_get(&chunk, 1, 64, 0, &state));
-	CHECK(state.count == 4);
+	CHECK(gp_block_reinf_faces(&state) == 4);
 
 	// a move onto itself is a no-op that reports success
 	u32 before_entries = chunk.reinf_entries;
 	CHECK(gp_chunk_reinf_move(&chunk, 1, 64, 0, 1, 64, 0));
 	CHECK(chunk.reinf_entries == before_entries);
 	CHECK(gp_chunk_reinf_get(&chunk, 1, 64, 0, &state));
-	CHECK(state.count == 4);
+	CHECK(gp_block_reinf_faces(&state) == 4);
 
 	gp_chunk_reinf_free(&chunk);
 }
@@ -1133,7 +1167,7 @@ static void test_world_move_across_chunks(void)
 	gp_chunk_reinf *dst = gp_world_chunk(w, 1, 0);
 	gp_block_reinf_t state;
 	CHECK(gp_chunk_reinf_get(dst, 0, 64, 7, &state));
-	CHECK(state.count == 2);
+	CHECK(gp_block_reinf_faces(&state) == 2);
 	CHECK(state.face[0] == GP_FACE_NORTH && state.durability[0] == 32);
 	CHECK(state.face[1] == GP_FACE_UP && state.durability[1] == 64);
 
@@ -1173,13 +1207,13 @@ static void test_world_move_carries_non_source_protection(void)
 
 	gp_block_reinf_t state;
 	CHECK(gp_chunk_reinf_get(c, 3, 64, 4, &state));
-	CHECK(state.count == 2);
+	CHECK(gp_block_reinf_faces(&state) == 2);
 	CHECK(state.face[0] == GP_FACE_UP && state.durability[0] == 32);
 	CHECK(state.face[1] == GP_FACE_NORTH && state.durability[1] == 16);
 	CHECK(!gp_chunk_reinf_get(c, 4, 64, 4, &state));
 
 	CHECK(gp_chunk_reinf_get(c, 9, 64, 4, &state));
-	CHECK(state.count == 1);
+	CHECK(gp_block_reinf_faces(&state) == 1);
 	CHECK(state.face[0] == GP_FACE_UP && state.durability[0] == 24);
 	CHECK(!gp_chunk_reinf_get(c, 8, 64, 4, &state));
 
@@ -1208,10 +1242,10 @@ static void test_world_move_refuses_protected_destination_face(void)
 
 	gp_block_reinf_t state;
 	CHECK(gp_chunk_reinf_get(chunk, 4, 64, 4, &state));
-	CHECK(state.count == 1);
+	CHECK(gp_block_reinf_faces(&state) == 1);
 	CHECK(state.face[0] == GP_FACE_UP && state.durability[0] == 8);
 	CHECK(gp_chunk_reinf_get(chunk, 5, 64, 4, &state));
-	CHECK(state.count == 1);
+	CHECK(gp_block_reinf_faces(&state) == 1);
 	CHECK(state.face[0] == GP_FACE_WEST && state.durability[0] == 32);
 
 	// This pull's destination face points east, toward its source.
@@ -1220,7 +1254,7 @@ static void test_world_move_refuses_protected_destination_face(void)
 	CHECK(!gp_world_move_block(w, from, (gp_pos){.x = 3, .y = 64, .z = 4}, GP_FACE_WEST));
 	CHECK(gp_chunk_reinf_get(chunk, 4, 64, 4, &state));
 	CHECK(gp_chunk_reinf_get(chunk, 3, 64, 4, &state));
-	CHECK(state.count == 1);
+	CHECK(gp_block_reinf_faces(&state) == 1);
 	CHECK(state.face[0] == GP_FACE_EAST && state.durability[0] == 24);
 
 	gp_world_destroy(w);
@@ -1253,9 +1287,9 @@ static void test_world_move_refuses_cross_chunk_overflow(void)
 
 	gp_block_reinf_t state;
 	CHECK(gp_chunk_reinf_get(src, 15, 64, 7, &state));
-	CHECK(state.count == 1);
+	CHECK(gp_block_reinf_faces(&state) == 1);
 	CHECK(gp_chunk_reinf_get(dst, 0, 64, 7, &state));
-	CHECK(state.count == 4);
+	CHECK(gp_block_reinf_faces(&state) == 4);
 	CHECK(src->reinf_entries == 1);
 	CHECK(dst->reinf_entries == 1);
 
@@ -1470,6 +1504,456 @@ static void test_cover_survives_serialization(void)
 	gp_chunk_reinf_free(&loaded);
 }
 
+/* --- record layout ---------------------------------------------------------
+ *
+ * GP_REC_FIELDS in griefprot_record.h is the format. These pin the properties
+ * that make adding a field a one line edit there rather than a rewrite: a record
+ * round trips, the fields do not overlap, and the bits past the last one are
+ * inert.
+ */
+
+/* Compared through the packed form, so struct padding can never decide it. */
+static bool records_equal(const gp_block_reinf_t *a, const gp_block_reinf_t *b)
+{
+	u8 pa[GP_REC_BYTES], pb[GP_REC_BYTES];
+	gp_block_reinf_pack(a, pa);
+	gp_block_reinf_pack(b, pb);
+	return memcmp(pa, pb, GP_REC_BYTES) == 0;
+}
+
+/* One writer per declared field, kept together so it is obvious that the tests
+   below cover everything the list has. The default branch fails on purpose: a
+   field added without a case here would otherwise go untested. */
+static void field_write(gp_block_reinf_t *r, u32 field, u32 variant)
+{
+	switch (field)
+	{
+	case 0:
+		for (u32 i = 0; i < GP_MAX_REINFORCED_FACES; i++)
+			r->durability[i] = (u16)(GP_REINF_DURABILITY_MAX - i * 97u - variant);
+		break;
+	case 1:
+		for (u32 i = 0; i < GP_MAX_REINFORCED_FACES; i++)
+			r->face[i] = (u8)((i * 2u + 1u) % (GP_FACE_COUNT + 1u));
+		break;
+	case 2:
+		for (u32 i = 0; i < GP_MAX_REINFORCED_FACES; i++)
+			r->slot_flags[i] = (u8)(variant % 4u);
+		break;
+	case 3:
+		r->motion_block = (u8)(variant & GP_MOTION_BLOCKED_ALL);
+		break;
+	case 4:
+		/* Both bits, so the overlap test proves the whole field stays clear of
+		   its neighbours rather than just the low bit. */
+		r->flags = (u8)GP_BLOCK_FLAG_ALL;
+		break;
+	default:
+		CHECK(false); // a field was added that this test does not write
+		break;
+	}
+}
+
+static void test_record_roundtrip(void)
+{
+	// 76 declared bits in 10 bytes, so four are spare: the two bit flags field
+	// fits without the record having to grow
+	CHECK(GP_REC_FIELD_COUNT == 5);
+	CHECK(GP_REC_BYTES == 10);
+	CHECK(GP_REC_SPARE_BITS == 4);
+	CHECK(GP_REINF_DURABILITY_MAX == 4095);
+
+	gp_block_reinf_t in;
+	memset(&in, 0, sizeof(in));
+
+	// every field at its widest, so a truncated width cannot hide behind a
+	// smaller sample
+	for (u32 i = 0; i < GP_MAX_REINFORCED_FACES; i++)
+	{
+		in.durability[i] = (i & 1u) ? GP_REINF_DURABILITY_MAX : (u16)(i * 1000u + 7u);
+		in.face[i] = (u8)((i * 2u + 1u) % (GP_FACE_COUNT + 1u));
+		in.slot_flags[i] = (u8)(3u - i);
+	}
+	in.motion_block = GP_MOTION_BLOCKED_ALL;
+	in.flags = (u8)GP_BLOCK_FLAG_ALL;
+
+	u8 bytes[GP_REC_BYTES];
+	gp_block_reinf_pack(&in, bytes);
+
+	gp_block_reinf_t out;
+	gp_block_reinf_unpack(bytes, &out);
+	CHECK(records_equal(&in, &out));
+
+	// each field on its own has to survive too, which is the case a mixed record
+	// would average away
+	for (u32 field = 0; field < GP_REC_FIELD_COUNT; field++)
+	{
+		gp_block_reinf_t one;
+		memset(&one, 0, sizeof(one));
+		field_write(&one, field, 1);
+
+		u8 packed[GP_REC_BYTES];
+		gp_block_reinf_pack(&one, packed);
+
+		gp_block_reinf_t back;
+		gp_block_reinf_unpack(packed, &back);
+		CHECK(records_equal(&one, &back));
+	}
+
+	// an all zero record is ten zero bytes, which is what keeps an untouched
+	// block free in a save
+	memset(&in, 0, sizeof(in));
+	gp_block_reinf_pack(&in, bytes);
+	for (u32 i = 0; i < GP_REC_BYTES; i++)
+		CHECK(bytes[i] == 0);
+}
+
+/* Two fields must not share a bit: packing each alone and or-ing the results
+   has to equal packing both together. A width overlapping its neighbour breaks
+   this even when both fields round trip on their own. */
+static void test_record_fields_do_not_overlap(void)
+{
+	for (u32 a = 0; a < GP_REC_FIELD_COUNT; a++)
+	{
+		for (u32 b = a + 1; b < GP_REC_FIELD_COUNT; b++)
+		{
+			gp_block_reinf_t ra, rb, both;
+			memset(&ra, 0, sizeof(ra));
+			memset(&rb, 0, sizeof(rb));
+			memset(&both, 0, sizeof(both));
+
+			field_write(&ra, a, 1);
+			field_write(&rb, b, 1);
+			field_write(&both, a, 1);
+			field_write(&both, b, 1);
+
+			u8 pa[GP_REC_BYTES], pb[GP_REC_BYTES], pboth[GP_REC_BYTES];
+			gp_block_reinf_pack(&ra, pa);
+			gp_block_reinf_pack(&rb, pb);
+			gp_block_reinf_pack(&both, pboth);
+
+			for (u32 i = 0; i < GP_REC_BYTES; i++)
+				CHECK((pa[i] | pb[i]) == pboth[i]);
+		}
+	}
+}
+
+/* Bits past the last declared field carry nothing. Reading them is a no op and
+   writing drops them, so a later field can grow into that space without the
+   bytes meaning anything different in the meantime. */
+static void test_record_spare_bits_are_inert(void)
+{
+	gp_block_reinf_t base;
+	memset(&base, 0, sizeof(base));
+	base.durability[0] = 1;
+	base.durability[3] = GP_REINF_DURABILITY_MAX;
+	base.face[0] = GP_FACE_UP;
+	base.face[3] = GP_FACE_EAST;
+	base.slot_flags[1] = 2;
+	base.motion_block = 1u << GP_FACE_NORTH;
+
+	u8 bytes[GP_REC_BYTES];
+	gp_block_reinf_pack(&base, bytes);
+
+	for (u32 bit = 0; bit < GP_REC_BYTES * 8u; bit++)
+	{
+		u8 flipped[GP_REC_BYTES];
+		memcpy(flipped, bytes, GP_REC_BYTES);
+		flipped[bit / 8u] ^= (u8)(1u << (bit % 8u));
+
+		gp_block_reinf_t got;
+		gp_block_reinf_unpack(flipped, &got);
+
+		if (bit < GP_REC_TOTAL_BITS)
+		{
+			// a declared bit changes what the record says
+			CHECK(!records_equal(&base, &got));
+		}
+		else
+		{
+			// a spare one does not
+			CHECK(records_equal(&base, &got));
+
+			u8 again[GP_REC_BYTES];
+			gp_block_reinf_pack(&got, again);
+			CHECK(memcmp(again, bytes, GP_REC_BYTES) == 0);
+		}
+	}
+}
+
+/* Durability is stored in 12 bits. A tier wider than that has to be refused
+   rather than truncated into the record, which would leave a host believing it
+   had reinforced a face further than it had. */
+static void test_record_durability_cap(void)
+{
+	gp_chunk_reinf chunk;
+	gp_chunk_reinf_init(&chunk, 384);
+
+	gp_block_reinf_t state;
+
+	// one past the cap: refused, and leaves no record behind
+	CHECK(!gp_chunk_reinf_add(&chunk, 0, 0, 0, GP_FACE_NORTH, GP_REINF_DURABILITY_MAX + 1));
+	CHECK(!gp_chunk_reinf_get(&chunk, 0, 0, 0, &state));
+
+	CHECK(gp_chunk_reinf_add(&chunk, 0, 0, 0, GP_FACE_NORTH, GP_REINF_DURABILITY_MAX));
+	CHECK(gp_chunk_reinf_get(&chunk, 0, 0, 0, &state));
+	CHECK(state.durability[0] == GP_REINF_DURABILITY_MAX);
+
+	// a merge that would overflow the field saturates rather than wrapping
+	CHECK(gp_chunk_reinf_add(&chunk, 1, 0, 0, GP_FACE_NORTH, GP_REINF_DURABILITY_MAX));
+	CHECK(gp_chunk_reinf_move(&chunk, 0, 0, 0, 1, 0, 0));
+	CHECK(gp_chunk_reinf_get(&chunk, 1, 0, 0, &state));
+	CHECK(state.durability[0] == GP_REINF_DURABILITY_MAX);
+
+	// and it drains from the cap rather than from a wrapped value
+	for (u32 i = 0; i + 1 < GP_REINF_DURABILITY_MAX; i++)
+		CHECK(gp_chunk_reinf_consume(&chunk, 1, 0, 0, GP_FACE_NORTH));
+	CHECK(!gp_chunk_reinf_consume(&chunk, 1, 0, 0, GP_FACE_NORTH));
+	CHECK(chunk.reinf_entries == 0);
+
+	gp_chunk_reinf_free(&chunk);
+}
+
+/* reinf_entries counts records. Exhausting one of several faces must not make a
+   block that is still protected look like it is gone. */
+static void test_record_entries_count_records(void)
+{
+	gp_chunk_reinf chunk;
+	gp_chunk_reinf_init(&chunk, 384);
+
+	CHECK(gp_chunk_reinf_add(&chunk, 0, 0, 0, GP_FACE_NORTH, 4));
+	CHECK(gp_chunk_reinf_add(&chunk, 0, 0, 0, GP_FACE_SOUTH, 4));
+	CHECK(chunk.reinf_entries == 1);
+
+	while (gp_chunk_reinf_consume(&chunk, 0, 0, 0, GP_FACE_NORTH))
+		;
+	CHECK(chunk.reinf_entries == 1);
+
+	gp_block_reinf_t state;
+	CHECK(gp_chunk_reinf_get(&chunk, 0, 0, 0, &state));
+	CHECK(gp_block_reinf_faces(&state) == 1);
+
+	while (gp_chunk_reinf_consume(&chunk, 0, 0, 0, GP_FACE_SOUTH))
+		;
+	CHECK(chunk.reinf_entries == 0);
+
+	gp_chunk_reinf_free(&chunk);
+}
+
+static void count_reinf(void *user, u32 x, u32 y, u32 z, const gp_block_reinf_t *reinf)
+{
+	u32 *seen = (u32 *)user;
+	(void)x;
+	(void)y;
+	(void)z;
+	(void)reinf;
+	(*seen)++;
+}
+
+/* A constraint is meaningful without any reinforced face, so the record has to
+   outlive the faces it started with. */
+static void test_record_motion_only_block(void)
+{
+	gp_chunk_reinf chunk;
+	gp_chunk_reinf_init(&chunk, 384);
+
+	CHECK(gp_chunk_reinf_motion_block(&chunk, 5, 5, 5) == GP_MOTION_BLOCKED_NONE);
+
+	// bits outside the six real directions are dropped rather than stored
+	CHECK(gp_chunk_reinf_motion_block_set(&chunk, 5, 5, 5, 0xFF));
+	CHECK(gp_chunk_reinf_motion_block(&chunk, 5, 5, 5) == GP_MOTION_BLOCKED_ALL);
+	CHECK(chunk.reinf_entries == 1);
+
+	gp_block_reinf_t state;
+	CHECK(gp_chunk_reinf_get(&chunk, 5, 5, 5, &state));
+	CHECK(gp_block_reinf_faces(&state) == 0);
+	CHECK(!gp_block_reinf_empty(&state));
+
+	// a block that carries a constraint is worth walking even with no faces on it
+	u32 seen = 0;
+	gp_chunk_reinf_visit(&chunk, count_reinf, &seen);
+	CHECK(seen == 1);
+
+	// clearing the last thing the record held drops it rather than leaving the
+	// sparse map paying for a block nothing constrains any more
+	CHECK(gp_chunk_reinf_motion_block_set(&chunk, 5, 5, 5, GP_MOTION_BLOCKED_NONE));
+	CHECK(chunk.reinf_entries == 0);
+	CHECK(!gp_chunk_reinf_get(&chunk, 5, 5, 5, &state));
+
+	seen = 0;
+	gp_chunk_reinf_visit(&chunk, count_reinf, &seen);
+	CHECK(seen == 0);
+
+	// setting zero on a block that has nothing is a no op, not an allocation
+	CHECK(gp_chunk_reinf_motion_block_set(&chunk, 6, 6, 6, GP_MOTION_BLOCKED_NONE));
+	CHECK(chunk.reinf_entries == 0);
+
+	gp_chunk_reinf_free(&chunk);
+}
+
+/* The new fields have to survive a move, a merge and a save. Nothing reads them
+   yet, so the round trip is all there is to hold them to. */
+static void test_record_new_fields_survive_move_merge_and_save(void)
+{
+	gp_chunk_reinf src, dst;
+	gp_chunk_reinf_init(&src, 384);
+
+	CHECK(gp_chunk_reinf_add(&src, 1, 64, 1, GP_FACE_NORTH, 32));
+	CHECK(gp_chunk_reinf_slot_flags_set(&src, 1, 64, 1, GP_FACE_NORTH, GP_SLOT_FLAG_ANCHORED));
+	CHECK(gp_chunk_reinf_motion_block_set(&src, 1, 64, 1, 1u << GP_FACE_UP));
+
+	// a move carries both across, and leaves nothing behind
+	CHECK(gp_chunk_reinf_move(&src, 1, 64, 1, 2, 64, 2));
+	CHECK(gp_chunk_reinf_slot_flags(&src, 2, 64, 2, GP_FACE_NORTH) == GP_SLOT_FLAG_ANCHORED);
+	CHECK(gp_chunk_reinf_motion_block(&src, 2, 64, 2) == (1u << GP_FACE_UP));
+	CHECK(gp_chunk_reinf_slot_flags(&src, 1, 64, 1, GP_FACE_NORTH) == 0);
+	CHECK(gp_chunk_reinf_motion_block(&src, 1, 64, 1) == GP_MOTION_BLOCKED_NONE);
+
+	// merging onto a block that already has the same face keeps the strictest of
+	// both, since neither end can free what the other is holding
+	CHECK(gp_chunk_reinf_add(&src, 3, 64, 3, GP_FACE_NORTH, 8));
+	CHECK(gp_chunk_reinf_motion_block_set(&src, 3, 64, 3, 1u << GP_FACE_DOWN));
+	CHECK(gp_chunk_reinf_move(&src, 2, 64, 2, 3, 64, 3));
+
+	gp_block_reinf_t state;
+	CHECK(gp_chunk_reinf_get(&src, 3, 64, 3, &state));
+	CHECK(state.durability[0] == 40);
+	CHECK(gp_chunk_reinf_slot_flags(&src, 3, 64, 3, GP_FACE_NORTH) == GP_SLOT_FLAG_ANCHORED);
+	CHECK(gp_chunk_reinf_motion_block(&src, 3, 64, 3) == ((1u << GP_FACE_UP) | (1u << GP_FACE_DOWN)));
+
+	// and through a save
+	arena *a = arena_create(65536);
+	tkv_object obj = gp_chunk_pack(&src, a);
+	CHECK(obj != NULL);
+
+	gp_chunk_reinf_init(&dst, 384);
+	CHECK(gp_chunk_unpack(obj, &dst));
+	CHECK(gp_chunk_reinf_slot_flags(&dst, 3, 64, 3, GP_FACE_NORTH) == GP_SLOT_FLAG_ANCHORED);
+	CHECK(gp_chunk_reinf_motion_block(&dst, 3, 64, 3) == ((1u << GP_FACE_UP) | (1u << GP_FACE_DOWN)));
+	CHECK(dst.reinf_entries == src.reinf_entries);
+
+	// a flag dies with the face it describes, but the record lives on for the
+	// constraint that is still set
+	while (gp_chunk_reinf_consume(&dst, 3, 64, 3, GP_FACE_NORTH))
+		;
+	CHECK(gp_chunk_reinf_slot_flags(&dst, 3, 64, 3, GP_FACE_NORTH) == 0);
+	CHECK(gp_chunk_reinf_motion_block(&dst, 3, 64, 3) != GP_MOTION_BLOCKED_NONE);
+	CHECK(dst.reinf_entries == 1);
+
+	// flags only mean something on a reinforced face
+	CHECK(!gp_chunk_reinf_slot_flags_set(&dst, 3, 64, 3, GP_FACE_NORTH, GP_SLOT_FLAG_ANCHORED));
+
+	arena_destroy(a);
+	gp_chunk_reinf_free(&dst);
+	gp_chunk_reinf_free(&src);
+}
+
+/* The face lock is the one flag the library enforces itself, and it has to
+   refuse new faces without refusing upgrades. Those are two different faces on
+   the same block, so getting the order wrong silently locks owners out of
+   reinforcing the sides they already built. */
+static void test_block_flags_lock_new_faces(void)
+{
+	gp_chunk_reinf chunk;
+	gp_chunk_reinf_init(&chunk, 384);
+
+	// a block with nothing on it cannot be locked: a lock describes protection
+	// that does not exist yet, and a record holding only one would never be
+	// cleaned up, because emptiness ignores the flags
+	CHECK(!gp_chunk_reinf_flags_set(&chunk, 1, 1, 1, GP_BLOCK_FLAG_LOCK_FACES, GP_BLOCK_FLAG_LOCK_FACES));
+	CHECK(gp_chunk_reinf_flags(&chunk, 1, 1, 1) == GP_BLOCK_FLAG_NONE);
+	CHECK(chunk.reinf_entries == 0);
+	CHECK(!gp_chunk_reinf_get(&chunk, 1, 1, 1, &(gp_block_reinf_t){0}));
+
+	CHECK(gp_chunk_reinf_add(&chunk, 1, 1, 1, GP_FACE_NORTH, 32));
+	CHECK(gp_chunk_reinf_flags_set(&chunk, 1, 1, 1, GP_BLOCK_FLAG_LOCK_FACES, GP_BLOCK_FLAG_LOCK_FACES));
+	CHECK((gp_chunk_reinf_flags(&chunk, 1, 1, 1) & GP_BLOCK_FLAG_LOCK_FACES) != 0);
+
+	// a face the block does not carry is refused, and the refusal costs the
+	// caller nothing: the block is untouched and the entry count does not move
+	CHECK(!gp_chunk_reinf_add(&chunk, 1, 1, 1, GP_FACE_UP, 32));
+	CHECK(gp_chunk_reinf_face_active(&chunk, 1, 1, 1, GP_FACE_UP) == false);
+	CHECK(gp_chunk_reinf_face_active(&chunk, 1, 1, 1, GP_FACE_NORTH));
+
+	// upgrading a face it already carries still works, which is the whole point
+	// of putting the check after the upgrade search rather than before it
+	CHECK(gp_chunk_reinf_add(&chunk, 1, 1, 1, GP_FACE_NORTH, 256));
+	gp_block_reinf_t state;
+	CHECK(gp_chunk_reinf_get(&chunk, 1, 1, 1, &state));
+	CHECK(state.durability[gp_block_reinf_slot(&state, GP_FACE_NORTH)] == 256);
+	CHECK(gp_block_reinf_faces(&state) == 1); // and it opened no second slot
+	CHECK(chunk.reinf_entries == 1);
+
+	// clearing the lock makes the block reinforceable again
+	CHECK(gp_chunk_reinf_flags_set(&chunk, 1, 1, 1, GP_BLOCK_FLAG_NONE, GP_BLOCK_FLAG_LOCK_FACES));
+	CHECK(gp_chunk_reinf_flags(&chunk, 1, 1, 1) == GP_BLOCK_FLAG_NONE);
+	CHECK(gp_chunk_reinf_add(&chunk, 1, 1, 1, GP_FACE_UP, 32));
+
+	// a mask selects which bits are written, so one host flag cannot be set by
+	// accident while the other is being set on purpose
+	CHECK(gp_chunk_reinf_flags_set(&chunk, 1, 1, 1, GP_BLOCK_FLAG_PISTON_FREE, GP_BLOCK_FLAG_PISTON_FREE));
+	CHECK(gp_chunk_reinf_flags(&chunk, 1, 1, 1) == GP_BLOCK_FLAG_PISTON_FREE);
+	CHECK(gp_chunk_reinf_flags_set(&chunk, 1, 1, 1, GP_BLOCK_FLAG_ALL, GP_BLOCK_FLAG_LOCK_FACES));
+	CHECK(gp_chunk_reinf_flags(&chunk, 1, 1, 1) == (GP_BLOCK_FLAG_PISTON_FREE | GP_BLOCK_FLAG_LOCK_FACES));
+
+	// bits the library does not define are dropped rather than stored, so a mask
+	// carrying a stale face id cannot reach the record
+	CHECK(gp_chunk_reinf_flags_set(&chunk, 1, 1, 1, 0xFF, 0xFF));
+	CHECK(gp_chunk_reinf_flags(&chunk, 1, 1, 1) == GP_BLOCK_FLAG_ALL);
+
+	// a mask with nothing in it writes nothing, and a block with no record at all
+	// still reads back as no flags
+	CHECK(gp_chunk_reinf_flags_set(&chunk, 9, 9, 9, 0xFF, 0));
+	CHECK(gp_chunk_reinf_flags(&chunk, 9, 9, 9) == GP_BLOCK_FLAG_NONE);
+
+	gp_chunk_reinf_free(&chunk);
+}
+
+/* Both flags describe the physical block rather than its plates, so a push has
+   to carry them. The move is the one case where losing them would be worst: the
+   very move piston freedom allowed would hand the block its protection back. */
+static void test_block_flags_travel_with_the_block(void)
+{
+	gp_chunk_reinf src, dst;
+	gp_chunk_reinf_init(&src, 384);
+
+	CHECK(gp_chunk_reinf_add(&src, 1, 64, 1, GP_FACE_NORTH, 32));
+	CHECK(gp_chunk_reinf_flags_set(&src, 1, 64, 1, GP_BLOCK_FLAG_ALL, GP_BLOCK_FLAG_ALL));
+
+	CHECK(gp_chunk_reinf_move(&src, 1, 64, 1, 2, 64, 2));
+	CHECK(gp_chunk_reinf_flags(&src, 2, 64, 2) == GP_BLOCK_FLAG_ALL);
+	CHECK(gp_chunk_reinf_flags(&src, 1, 64, 1) == GP_BLOCK_FLAG_NONE);
+
+	// merging onto a block that holds only part of the mask keeps both, for the
+	// same reason motion_block is or'd rather than overwritten
+	CHECK(gp_chunk_reinf_add(&src, 3, 64, 3, GP_FACE_NORTH, 8));
+	CHECK(gp_chunk_reinf_flags_set(&src, 3, 64, 3, GP_BLOCK_FLAG_PISTON_FREE, GP_BLOCK_FLAG_PISTON_FREE));
+	CHECK(gp_chunk_reinf_move(&src, 2, 64, 2, 3, 64, 3));
+	CHECK(gp_chunk_reinf_flags(&src, 3, 64, 3) == GP_BLOCK_FLAG_ALL);
+
+	// and through a save, which is where a forgotten field would otherwise go
+	// missing for every block in the world at once
+	arena *a = arena_create(65536);
+	tkv_object obj = gp_chunk_pack(&src, a);
+	CHECK(obj != NULL);
+
+	gp_chunk_reinf_init(&dst, 384);
+	CHECK(gp_chunk_unpack(obj, &dst));
+	CHECK(gp_chunk_reinf_flags(&dst, 3, 64, 3) == GP_BLOCK_FLAG_ALL);
+
+	// the mask is not durability, so it does not stop the block breaking. It
+	// goes when the block does, which is what Protection.clearBlockAndPartner
+	// and gp_chunk_reinf_clear rely on.
+	while (gp_chunk_reinf_consume(&dst, 3, 64, 3, GP_FACE_NORTH))
+		;
+	CHECK(dst.reinf_entries == 0);
+	CHECK(gp_chunk_reinf_flags(&dst, 3, 64, 3) == GP_BLOCK_FLAG_NONE);
+
+	arena_destroy(a);
+	gp_chunk_reinf_free(&dst);
+	gp_chunk_reinf_free(&src);
+}
+
 int main(void)
 {
 	gp_config cfg;
@@ -1501,12 +1985,22 @@ int main(void)
 	test_shield_round_robin();
 	test_shield_share_shrinks_with_new_targets();
 	test_shield_fuel_and_power();
+	test_shield_waits_for_regeneration_window();
 	test_shield_range_mode();
 	test_shield_range_share_and_fairness();
 	test_shield_range_with_nothing_protectable();
 	test_shield_target_editing();
 	test_shield_decay();
 	test_break_resolution();
+	test_record_roundtrip();
+	test_record_fields_do_not_overlap();
+	test_record_spare_bits_are_inert();
+	test_record_durability_cap();
+	test_record_entries_count_records();
+	test_record_motion_only_block();
+	test_block_flags_lock_new_faces();
+	test_block_flags_travel_with_the_block();
+	test_record_new_fields_survive_move_merge_and_save();
 	test_chunk_pack_roundtrip();
 	test_chunk_pack_group_spill();
 	test_shield_pack_roundtrip();

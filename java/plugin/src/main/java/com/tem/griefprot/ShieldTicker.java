@@ -1,7 +1,7 @@
 package com.tem.griefprot;
 
 import com.tem.griefprot.world.GriefWorld;
-import java.time.Duration;
+import java.util.logging.Level;
 import org.bukkit.Chunk;
 import org.bukkit.scheduler.BukkitRunnable;
 import org.bukkit.util.Vector;
@@ -9,11 +9,10 @@ import org.bukkit.util.Vector;
 /**
  * Advances shields and sweeps away decayed protection.
  *
- * <p>The library only compares differences between timestamps, so any monotonic
- * clock works. {@link System#nanoTime()} is used rather than
- * {@code currentTimeMillis()} because it is immune to the wall clock jumping
- * backwards, which would otherwise hand a shield a huge negative interval and
- * either drain it instantly or skip its whole window.
+ * <p>The ticker advances on the server thread once per 20 game ticks. Its clock
+ * therefore measures game time rather than wall time: low TPS slows fuel
+ * consumption and shield regeneration in real time, as expected for a
+ * tick-based mechanic.
  *
  * <p>Decay runs on a timer rather than every tick. Sweeping every loaded chunk
  * every tick would be pure overhead, since the shortest interval a record can
@@ -21,34 +20,31 @@ import org.bukkit.util.Vector;
  */
 public final class ShieldTicker extends BukkitRunnable {
 
-    /** How often the decay sweep runs. */
-    private static final long DECAY_PERIOD_TICKS = 100L;
+    /** How often the decay sweep runs, in game seconds. */
+    private static final long DECAY_PERIOD_SECONDS = 5L;
 
     private final GriefProtPlugin plugin;
-    private final long startNanos = System.nanoTime();
 
-    private long nextDecayNanos;
+    private long gameSeconds;
+    private long nextDecaySeconds = DECAY_PERIOD_SECONDS;
 
     public ShieldTicker(GriefProtPlugin plugin) {
         this.plugin = plugin;
-        this.nextDecayNanos = startNanos + Duration.ofSeconds(5).toNanos();
     }
 
     @Override
     public void run() {
-        long now = System.nanoTime();
-        double seconds = (now - startNanos) / 1_000_000_000.0;
-
         for (GriefWorld world : plugin.trackedWorlds()) {
-            tickShields(world, (long) seconds);
+            tickShields(world, gameSeconds);
         }
 
-        if (now >= nextDecayNanos) {
+        if (gameSeconds >= nextDecaySeconds) {
             for (GriefWorld world : plugin.trackedWorlds()) {
-                sweepDecay(world, (long) seconds);
+                sweepDecay(world, gameSeconds);
             }
-            nextDecayNanos = now + Duration.ofSeconds(5).toNanos();
+            nextDecaySeconds = gameSeconds + DECAY_PERIOD_SECONDS;
         }
+        gameSeconds++;
     }
 
     /**
@@ -65,7 +61,20 @@ public final class ShieldTicker extends BukkitRunnable {
             if (shield == 0) {
                 continue;
             }
-            world.abi().shieldTick(shield, seconds);
+            int granted = world.abi().shieldTick(shield, seconds);
+            if (granted > 0 || plugin.getLogger().isLoggable(Level.FINE)) {
+                var position = world.abi().shieldGetPos(shield);
+                var state = world.abi().shieldGetState(shield);
+                String message = "shield event=tick world=" + world.bukkit().getName()
+                        + " x=" + position.x() + " y=" + position.y() + " z=" + position.z()
+                        + " powered=" + state.powered() + " running=" + state.running()
+                        + " fuel=" + state.fuel() + " points_granted=" + granted;
+                if (granted > 0) {
+                    plugin.getLogger().info(message);
+                } else {
+                    plugin.getLogger().fine(message);
+                }
+            }
         }
     }
 

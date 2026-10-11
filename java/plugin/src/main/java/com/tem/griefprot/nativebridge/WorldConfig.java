@@ -9,12 +9,12 @@ package com.tem.griefprot.nativebridge;
  *
  * @param maxFacesPerBlock how many distinct faces may carry reinforcement
  * @param shieldPool how many shields a world may hold at once
- * @param shieldRegen interval in seconds between regeneration grants
+ * @param shieldRegenPointsPerWindow total points the shield may grant each window
  * @param shieldWindow seconds a shield protects before it must recharge
  * @param shieldRange radius in blocks a shield reaches
  * @param shieldMaxTargets how many blocks one shield may cover
  * @param shieldFuelMax fuel a full shield holds
- * @param shieldFuelPerSec fuel burned per second while running
+ * @param shieldFuelPerSec fuel units burned per game second while running
  * @param decayInterval seconds before an uncovered protection record decays
  * @param decayAmount how much durability one decay sweep removes
  * @param chunkHeight usable world height in blocks
@@ -24,7 +24,7 @@ package com.tem.griefprot.nativebridge;
 public record WorldConfig(
         int maxFacesPerBlock,
         int shieldPool,
-        int shieldRegen,
+        int shieldRegenPointsPerWindow,
         int shieldWindow,
         int shieldRange,
         int shieldMaxTargets,

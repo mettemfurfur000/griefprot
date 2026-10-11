@@ -13,12 +13,12 @@ import java.util.Set;
 /**
  * The Bukkit implementation of {@link WorldPolicy}.
  *
- * <p>Two rules keep the native store honest:
+ * <p>These rules keep the native store honest:
  *
  * <ul>
- *   <li>Only solid blocks can be protected. Letting a shield sit on air would
- *       spend fuel to protect a position the player can simply build into, and
- *       would fill the store with records nothing can ever break.
+ *   <li>Only solid blocks with positive hardness can be protected. Letting a
+ *       shield sit on air or a zero-hardness plant would spend fuel protecting
+ *       a position that cannot meaningfully retain protection.
  *   <li>Protection is refused for blocks the world can replace on its own, such
  *       as fluids, so a record cannot outlive the block it describes.
  * </ul>
@@ -58,6 +58,10 @@ public final class BukkitWorldPolicy implements WorldPolicy {
                 plugin.getLogger().warning(material + " can never be protected, ignoring");
                 continue;
             }
+            if (!hasProtectionSurface(material)) {
+                plugin.getLogger().warning(material + " is not solid with positive hardness, ignoring");
+                continue;
+            }
             allowed.add(material);
         }
     }
@@ -77,21 +81,28 @@ public final class BukkitWorldPolicy implements WorldPolicy {
         if (ALWAYS_REFUSED.contains(material)) {
             return false;
         }
-        if (!material.isSolid() && !material.isBlock()) {
+        if (!hasProtectionSurface(material)) {
             return false;
         }
         return allowed.isEmpty() || allowed.contains(material);
     }
 
+    static boolean hasProtectionSurface(Material material) {
+        return hasProtectionSurface(material.isSolid(), material.getHardness());
+    }
+
+    static boolean hasProtectionSurface(boolean solid, float hardness) {
+        return solid && hardness > 0;
+    }
+
     @Override
     public int grant(GriefWorld world, int x, int y, int z, int amount, int cap) {
-        int offered = Math.min(amount, cap);
+        int offered = Math.min(Math.min(amount, cap), grantAmount);
         if (offered <= 0) {
             return 0;
         }
-        // The library caps the block itself; this only decides how much of the
-        // shield's offer to actually hand over.
-        return Math.min(grantAmount, offered);
+        // The native shield accounts only for what the host actually stored.
+        return world.abi().pointsAdd(world.handle(), x, y, z, offered, cap);
     }
 
     @Override

@@ -32,6 +32,7 @@ gp_shield *gp_shield_create(const gp_config *cfg, gp_pos pos, u32 capacity)
 	shield->powered = false;
 	shield->running = false;
 	shield->window_start = 0;
+	shield->last_tick = 0;
 	shield->started = false;
 	return shield;
 }
@@ -140,6 +141,18 @@ void gp_shield_set_powered(gp_shield *shield, bool powered)
 {
 	if (shield)
 		shield->powered = powered;
+}
+
+void gp_shield_apply_config(gp_shield *shield, const gp_config *cfg)
+{
+	if (!shield || !cfg)
+		return;
+
+	shield->pool = cfg->shield_pool;
+	shield->regen_per_window = cfg->shield_regen;
+	shield->window = cfg->shield_window ? cfg->shield_window : 1;
+	shield->range = cfg->shield_range;
+	shield->fuel_per_sec = cfg->shield_fuel_per_sec;
 }
 
 /* One pass of the round robin.
@@ -366,6 +379,7 @@ u32 gp_shield_tick(gp_shield *shield, u64 now, const gp_shield_sink *sink, u32 *
 	if (!shield->started)
 	{
 		shield->window_start = now;
+		shield->last_tick = now;
 		shield->started = true;
 		return 0;
 	}
@@ -376,17 +390,25 @@ u32 gp_shield_tick(gp_shield *shield, u64 now, const gp_shield_sink *sink, u32 *
 		// an idle shield keeps its resume point so it does not restart the
 		// round robin every time it comes back online
 		shield->window_start = now;
+		shield->last_tick = now;
 		shield->started = true;
 		return 0;
 	}
 
 	if (now < shield->window_start)
 	{
-		shield->window_start = now; // clock went backwards, resync
+		shield->window_start = now;
+		shield->last_tick = now; // clock went backwards, resync both clocks
 		return 0;
 	}
 
-	u64 elapsed = now - shield->window_start;
+	if (now < shield->last_tick)
+	{
+		shield->last_tick = now;
+		return 0;
+	}
+
+	u64 elapsed = now - shield->last_tick;
 	if (elapsed == 0)
 		return 0;
 
@@ -397,11 +419,21 @@ u32 gp_shield_tick(gp_shield *shield, u64 now, const gp_shield_sink *sink, u32 *
 		shield->fuel = 0;
 		shield->running = false;
 		shield->window_start = now;
+		shield->last_tick = now;
 		return 0;
 	}
 	shield->fuel -= burn;
+	shield->last_tick = now;
 
-	shield->window_start += elapsed; // carry the remainder, do not drift
+	if (now - shield->window_start < shield->window)
+	{
+		// Keep coverage current between regeneration windows so decay does not
+		// remove protection while a powered, fuelled shield is still holding it.
+		claim_coverage(shield, sink, now);
+		return 0;
+	}
+
+	shield->window_start += shield->window; // carry the remainder, do not drift
 	u32 granted = gp_shield_run_window(shield, sink, now);
 
 	if (points_granted)

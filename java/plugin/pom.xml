@@ -66,7 +66,7 @@
         </includes>
       </resource>
       <!--
-        The compiled shim is dropped in by scripts/build.sh, which calls
+        The compiled shim is dropped in by scripts/build_plugin.sh, which calls
         "make -C ../.. abi". It is shipped verbatim: FFM must load a real file
         from disk, so it cannot live inside the jar as a resource and be read as
         a blob. Filtered resources are kept separate so ${version} substitution

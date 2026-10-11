@@ -152,10 +152,17 @@ uint64_t gp_abi_world_memory(gp_h_world world);
 
 /*
  * Applies `amount` break events to one face. Returns 1 on success, 0 when the
- * block is out of range, that face is already reinforced, or the merge would
- * need more distinct faces than the world allows.
+ * block is out of range, that face is already reinforced, the block is locked
+ * against new faces and this is not one it already carries, `amount` is 0 or
+ * above the ceiling a face can hold, or the merge would need more distinct faces
+ * than the world allows.
  */
 int gp_abi_reinf_add(gp_h_world world, int32_t x, int32_t y, int32_t z, uint32_t face, uint32_t amount);
+
+/* Largest amount gp_abi_reinf_add will accept, which is the width of the stored
+   durability field rather than anything about this shim. A host that lets an
+ * admin configure a tier should compare against this rather than hardcode it. */
+uint32_t gp_abi_reinf_durability_max(void);
 
 /* Remaining break events on a face, 0 when the face carries none. */
 uint32_t gp_abi_reinf_face_durability(gp_h_world world, int32_t x, int32_t y, int32_t z, uint32_t face);
@@ -176,6 +183,45 @@ uint32_t gp_abi_reinf_face_count(gp_h_world world, int32_t x, int32_t y, int32_t
  * assuming any stronger one would promise protection the block does not have.
  */
 uint32_t gp_abi_weakest_face(gp_h_world world, int32_t x, int32_t y, int32_t z);
+
+/* --- block flags ----------------------------------------------------------- */
+
+/*
+ * Per block behaviour bits, held once per record rather than once per face.
+ *
+ * GP_BLOCK_FLAG_LOCK_FACES stops gp_abi_reinf_add opening a face the block does
+ * not already carry. Upgrades are still allowed: the point is to stop a build
+ * growing new protected sides, not to lock its owner out of the ones it built.
+ *
+ * GP_BLOCK_FLAG_PISTON_FREE waives the library's own push and pull rules for the
+ * block, so a reinforced block can still be part of a moving contraption. The
+ * protection itself travels with it as usual, and a host still has to honour the
+ * flag where it decides what a piston may do.
+ *
+ * Exposed as functions so a host never has to hardcode a bit position.
+ */
+uint32_t gp_abi_block_flag_lock_faces(void);
+uint32_t gp_abi_block_flag_piston_free(void);
+uint32_t gp_abi_block_flag_all(void);
+
+/* The block's flags, 0 when it carries no record at all. */
+uint32_t gp_abi_reinf_flags(gp_h_world world, int32_t x, int32_t y, int32_t z);
+
+/*
+ * Writes `flags & mask` into the block's flags, leaving bits outside the mask
+ * alone, so a host can set one bit without reading the current value of another.
+ * Bits the library does not define are dropped from both.
+ *
+ * Refuses a block with no reinforced face, so a flag can never exist without
+ * protection for it to describe. Returns 1 when the block was written or was
+ * already in the requested state, 0 when it was refused.
+ */
+int gp_abi_reinf_flags_set(gp_h_world world, int32_t x, int32_t y, int32_t z, uint32_t flags,
+                           uint32_t mask);
+
+/* Convenience readers, 0 for a block with no record. */
+int gp_abi_reinf_faces_locked(gp_h_world world, int32_t x, int32_t y, int32_t z);
+int gp_abi_reinf_piston_free(gp_h_world world, int32_t x, int32_t y, int32_t z);
 
 /* --- break resolution ----------------------------------------------------- */
 

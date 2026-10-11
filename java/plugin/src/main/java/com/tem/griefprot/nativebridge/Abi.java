@@ -94,6 +94,16 @@ public final class Abi {
     private final MethodHandle reinfClear;
     private final MethodHandle reinfFaceCount;
     private final MethodHandle weakestFace;
+    private final MethodHandle reinfDurabilityMax;
+
+    // --- block flags ---
+    private final MethodHandle blockFlagLockFaces;
+    private final MethodHandle blockFlagPistonFree;
+    private final MethodHandle blockFlagAll;
+    private final MethodHandle reinfFlags;
+    private final MethodHandle reinfFlagsSet;
+    private final MethodHandle reinfFacesLocked;
+    private final MethodHandle reinfPistonFree;
 
     // --- break ---
     private final MethodHandle resolveBreak;
@@ -139,6 +149,13 @@ public final class Abi {
     private final int fWest;
     private final int fEast;
     private final int fCount;
+    private final int durabilityMax;
+
+    // Block flag bits, likewise asked of the library so a plugin never hardcodes
+    // a position inside a record it cannot see the layout of.
+    private final int lockFacesFlag;
+    private final int pistonFreeFlag;
+    private final int allBlockFlags;
 
     public Abi() {
         NativeLib lib = NativeLib.get();
@@ -197,6 +214,16 @@ public final class Abi {
         this.reinfClear = down(linker, lookup, "gp_abi_reinf_clear", FunctionDescriptor.of(JAVA_INT, w3()));
         this.reinfFaceCount = down(linker, lookup, "gp_abi_reinf_face_count", FunctionDescriptor.of(JAVA_INT, w3()));
         this.weakestFace = down(linker, lookup, "gp_abi_weakest_face", FunctionDescriptor.of(JAVA_INT, w3()));
+        this.reinfDurabilityMax = down(linker, lookup, "gp_abi_reinf_durability_max", face);
+
+        this.blockFlagLockFaces = down(linker, lookup, "gp_abi_block_flag_lock_faces", face);
+        this.blockFlagPistonFree = down(linker, lookup, "gp_abi_block_flag_piston_free", face);
+        this.blockFlagAll = down(linker, lookup, "gp_abi_block_flag_all", face);
+        this.reinfFlags = down(linker, lookup, "gp_abi_reinf_flags", FunctionDescriptor.of(JAVA_INT, w3()));
+        this.reinfFlagsSet = down(
+                linker, lookup, "gp_abi_reinf_flags_set", FunctionDescriptor.of(JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT));
+        this.reinfFacesLocked = down(linker, lookup, "gp_abi_reinf_faces_locked", FunctionDescriptor.of(JAVA_INT, w3()));
+        this.reinfPistonFree = down(linker, lookup, "gp_abi_reinf_piston_free", FunctionDescriptor.of(JAVA_INT, w3()));
 
         this.resolveBreak = down(
                 linker,
@@ -247,6 +274,10 @@ public final class Abi {
         this.fWest = callInt(faceWest);
         this.fEast = callInt(faceEast);
         this.fCount = callInt(faceCount);
+        this.durabilityMax = callInt(reinfDurabilityMax);
+        this.lockFacesFlag = callInt(blockFlagLockFaces);
+        this.pistonFreeFlag = callInt(blockFlagPistonFree);
+        this.allBlockFlags = callInt(blockFlagAll);
     }
 
     // --- descriptor helpers ---------------------------------------------------
@@ -587,6 +618,80 @@ public final class Abi {
     public int weakestFace(int world, int x, int y, int z) {
         try {
             return (int) weakestFace.invokeExact(world, x, y, z);
+        } catch (Throwable t) {
+            throw new IllegalStateException(t);
+        }
+    }
+
+    /**
+     * Largest reinforcement value a face can hold.
+     *
+     * <p>This is the width of the stored durability field, not a policy decision,
+     * so it comes from the library rather than being hardcoded here: a host that
+     * lets an admin configure a tier needs to clamp against the real ceiling or
+     * the plate would be silently refused at placement.
+     */
+    public int reinfDurabilityMax() {
+        return durabilityMax;
+    }
+
+    // --- block flags ----------------------------------------------------------
+
+    /**
+     * Bit that stops a block taking reinforcement on any face it does not already
+     * carry. Upgrades to a face it does carry are still allowed.
+     */
+    public int blockFlagLockFaces() {
+        return lockFacesFlag;
+    }
+
+    /**
+     * Bit that waives the library's push and pull rules for a block, so a
+     * reinforced block can still be moved by a piston. The protection itself
+     * travels with the block as usual.
+     */
+    public int blockFlagPistonFree() {
+        return pistonFreeFlag;
+    }
+
+    /** Every block flag the library defines, for clearing them in one call. */
+    public int blockFlagAll() {
+        return allBlockFlags;
+    }
+
+    /** The block's flags, 0 when it carries no record. */
+    public int reinfFlags(int world, int x, int y, int z) {
+        try {
+            return (int) reinfFlags.invokeExact(world, x, y, z);
+        } catch (Throwable t) {
+            throw new IllegalStateException(t);
+        }
+    }
+
+    /**
+     * Writes {@code flags & mask} into a block's flags, leaving every other bit
+     * alone. Refuses a block with no reinforced face, so a flag can never be set
+     * on protection that does not exist.
+     */
+    public boolean reinfFlagsSet(int world, int x, int y, int z, int flags, int mask) {
+        try {
+            return (int) reinfFlagsSet.invokeExact(world, x, y, z, flags, mask) != 0;
+        } catch (Throwable t) {
+            throw new IllegalStateException(t);
+        }
+    }
+
+    public boolean reinfFacesLocked(int world, int x, int y, int z) {
+        try {
+            return (int) reinfFacesLocked.invokeExact(world, x, y, z) != 0;
+        } catch (Throwable t) {
+            throw new IllegalStateException(t);
+        }
+    }
+
+    public boolean reinfPistonFree(int world, int x, int y, int z) {
+        try {
+            return (int) reinfPistonFree.invokeExact(world, x, y, z) != 0;
         } catch (Throwable t) {
             throw new IllegalStateException(t);
         }

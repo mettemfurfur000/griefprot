@@ -14,6 +14,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
+import java.util.function.IntConsumer;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import org.bukkit.Chunk;
@@ -83,6 +84,10 @@ public final class GriefWorld implements AutoCloseable {
         HostSink.register(hostId, world);
         world.installSink();
         world.load();
+        // Loading restores the saved world config and shield snapshots. Apply
+        // the current plugin config again so existing shields use current
+        // timings, without replacing their fuel or target lists.
+        world.applyConfig(config);
         return world;
     }
 
@@ -95,7 +100,7 @@ public final class GriefWorld implements AutoCloseable {
                 handle,
                 config.maxFacesPerBlock(),
                 config.shieldPool(),
-                config.shieldRegen(),
+                config.shieldRegenPointsPerWindow(),
                 config.shieldWindow(),
                 config.shieldRange(),
                 config.shieldMaxTargets(),
@@ -166,29 +171,60 @@ public final class GriefWorld implements AutoCloseable {
             return;
         }
         abi.chunkAt(handle, chunk.getX() * 16, chunk.getWorld().getMinHeight(), chunk.getZ() * 16);
+        resumeShieldsIn(chunk);
     }
 
     /**
      * Releases a chunk from the native store.
      *
-     * <p>Any shield sitting in this chunk goes with it. A shield handle that
-     * outlived its chunk would keep ticking and paying out against coordinates
-     * the server no longer considers loaded.
+     * <p>Any shield sitting in this chunk is suspended rather than destroyed. See
+     * {@link #suspendShieldsIn} for why that is enough to make it safe and why
+     * destroying it was not.
      */
     public void onChunkUnload(Chunk chunk) {
         if (closed) {
             return;
         }
-        retireShieldsIn(chunk);
-        if (!abi.chunkUnload(handle, chunk.getX(), chunk.getZ())) {
-            // Nothing resident there. Benign: unload can race our own bookkeeping.
+        if (!abi.chunkIsLoaded(handle, chunk.getX(), chunk.getZ())) {
+            // Nothing resident here, so nothing anchored here can have been
+            // running. This is the case the chunk release below used to answer by
+            // returning false and carrying on, and it is better answered here:
+            // suspending first would cut power to a shield in a chunk that was
+            // never loaded in the first place.
             return;
         }
+        suspendShieldsIn(chunk);
+        abi.chunkUnload(handle, chunk.getX(), chunk.getZ());
     }
 
-    private void retireShieldsIn(Chunk chunk) {
+    /**
+     * Stops the shields anchored in this chunk, and leaves them alive.
+     *
+     * <p>A shield reaching into a chunk the server has released is a liability
+     * rather than a saving, but {@code gp_shield_tick} already refuses to call
+     * the host at all for a shield that is not both powered and fuelled: the
+     * range coverage pass, which is the part that would answer {@code getBlockAt}
+     * across a whole cube, never runs for one. Unpowering is therefore enough to
+     * stop a shield touching coordinates the server no longer considers real,
+     * without touching anything that makes the shield come back wrong.
+     *
+     * <p>Destroying it instead loses it outright. The library packs every live
+     * shield into the save it writes at shutdown, so a shield retired this way
+     * was simply not in the next file -- which for a generator a player had built
+     * and walked away from meant coming back to nothing, with no error anywhere.
+     */
+    private void suspendShieldsIn(Chunk chunk) {
+        forEachShieldIn(chunk, shield -> abi.shieldSetPowered(shield, false));
+    }
+
+    /** Puts the shields anchored in this chunk back under power. */
+    private void resumeShieldsIn(Chunk chunk) {
+        forEachShieldIn(chunk, shield -> abi.shieldSetPowered(shield, true));
+    }
+
+    private void forEachShieldIn(Chunk chunk, IntConsumer action) {
         int count = abi.shieldCount(handle);
-        for (int index = count - 1; index >= 0; index--) {
+        for (int index = 0; index < count; index++) {
             int shield = abi.shieldAt(handle, index);
             if (shield == 0) {
                 continue;
@@ -198,8 +234,7 @@ public final class GriefWorld implements AutoCloseable {
             // stays correct for negative coordinates, which matter in the Nether
             // where >> 4 on a negative int still floors but / 16 truncates.
             if ((pos.x() >> 4) == chunk.getX() && (pos.z() >> 4) == chunk.getZ()) {
-                abi.shieldDestroy(shield);
-                shields.remove(Integer.valueOf(shield));
+                action.accept(shield);
             }
         }
     }
@@ -221,9 +256,36 @@ public final class GriefWorld implements AutoCloseable {
         shields.add(shield);
     }
 
+    /** Removes a shield handle from this world's unload bookkeeping. */
+    public void untrackShield(int shield) {
+        shields.remove(Integer.valueOf(shield));
+    }
+
     /** Every shield handle currently alive in this world. */
     public List<Integer> shields() {
         return List.copyOf(shields);
+    }
+
+    /**
+     * The shield anchored at one position, or 0 when there is none.
+     *
+     * <p>Linear, because the store keeps no index by position and a world holds
+     * far fewer shields than it holds chunks. Callers that ask this every tick
+     * should keep the answer rather than looking it up again.
+     */
+    public int shieldHandleAt(int x, int y, int z) {
+        int count = abi.shieldCount(handle);
+        for (int index = 0; index < count; index++) {
+            int shield = abi.shieldAt(handle, index);
+            if (shield == 0) {
+                continue;
+            }
+            Pos pos = abi.shieldGetPos(shield);
+            if (pos.x() == x && pos.y() == y && pos.z() == z) {
+                return shield;
+            }
+        }
+        return 0;
     }
 
     /** Runs one decay sweep over a chunk. */

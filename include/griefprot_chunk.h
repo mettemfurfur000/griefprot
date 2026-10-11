@@ -2,48 +2,23 @@
 #define GRIEFPROT_CHUNK_H
 
 #include "general.h"
+#include "griefprot_record.h"
 #include "griefprot_sparse.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-#define GP_MAX_REINFORCED_FACES 4
-
-/* Packed per block record: 4 x u16 durability + 4 x 3 bit face ids = 10 bytes. */
-#define GP_SPARSE_REINF_VALUE_SIZE 10
-
-/* Face indices.
-
-   NONE is deliberately zero: reinforcement records are zero filled when
-   allocated, so zero must mean "slot unused" rather than a real face. */
-typedef enum
-{
-	GP_FACE_NONE = 0,
-	GP_FACE_DOWN = 1,
-	GP_FACE_UP = 2,
-	GP_FACE_NORTH = 3,
-	GP_FACE_SOUTH = 4,
-	GP_FACE_WEST = 5,
-	GP_FACE_EAST = 6,
-	GP_FACE_COUNT = 7
-} gp_face_t;
-
-/* Public, unpacked view of one block's reinforcement state. */
-typedef struct
-{
-	u16 durability[GP_MAX_REINFORCED_FACES]; // remaining break events per slot
-	u8 face[GP_MAX_REINFORCED_FACES];       // GP_FACE_* occupying each slot
-	u8 count;                               // slots in use, 0..4
-} gp_block_reinf_t;
+/* Bytes one per block reinforcement record occupies in the sparse map and in a
+   save is GP_REC_BYTES, from the field list in griefprot_record.h. */
 
 /*
 	Per-chunk sparse reinforcement storage.
 
 	Blocks with no reinforcement cost nothing: the backing table only grows to
 	hold the blocks that actually carry protection. The serialized form is the
-	table itself (dense block index + packed 10 byte record per entry), which
-	is what gets written into chunk NBT by the platform adapters.
+	table itself (dense block index + one packed record per entry), which is what
+	gets written into chunk NBT by the platform adapters.
 */
 typedef struct
 {
@@ -71,18 +46,71 @@ void gp_chunk_reinf_free(gp_chunk_reinf *chunk);
  * can never exceed the best tier available, and a weak plate can never undo a
  * strong one.
  *
- * `amount` must be greater than zero. Returns false when the face is already at
- * or above `amount`, when all four slots are taken and this face is not one of
- * them, or when the position is invalid. A false return means the block was not
- * modified, so a host can keep the item it was about to spend.
+ * A block carrying GP_BLOCK_FLAG_LOCK_FACES still takes upgrades but opens no new
+ * face, which is what the flag is for.
+ *
+ * `amount` must be greater than zero and no more than
+ * GP_REINF_DURABILITY_MAX, which is the most a face can hold in the record.
+ * Returns false when the face is already at or above `amount`, when the block is
+ * locked and the face is not one it already carries, when all four slots are
+ * taken and this face is not one of them, when `amount` is out of range, or when
+ * the position is invalid. A false return means the block was not modified, so a
+ * host can keep the item it was about to spend.
  */
 bool gp_chunk_reinf_add(gp_chunk_reinf *chunk, u32 x, u32 y, u32 z, gp_face_t face, u16 amount);
 
 /* True when the given face carries any reinforcement. */
 bool gp_chunk_reinf_face_active(const gp_chunk_reinf *chunk, u32 x, u32 y, u32 z, gp_face_t face);
 
-/* Reads the block state. Returns false when the block carries no protection. */
+/* Reads the block record. Returns false when the block carries no record at all,
+   which is not the same as carrying a record with no reinforced face: a block
+   held in place by a motion constraint has no face and still has a record. Use
+   gp_block_reinf_faces on the result to ask how many faces are protected. */
 bool gp_chunk_reinf_get(const gp_chunk_reinf *chunk, u32 x, u32 y, u32 z, gp_block_reinf_t *out);
+
+/*
+	Per slot flags, one of GP_SLOT_FLAG_*.
+
+	Stored and carried by merges, moves and saves, but no rule reads them yet.
+	They are reachable now so the layout and the round trip are settled before
+	anything depends on them.
+*/
+u8 gp_chunk_reinf_slot_flags(const gp_chunk_reinf *chunk, u32 x, u32 y, u32 z, gp_face_t face);
+
+/* Replaces the flags on `face`. Pass 0 to clear them. False when the face is not
+   reinforced or the position is invalid, in which case nothing changed. */
+bool gp_chunk_reinf_slot_flags_set(gp_chunk_reinf *chunk, u32 x, u32 y, u32 z, gp_face_t face, u8 flags);
+
+/* Directions a piston may not move this block in, a bit per GP_FACE_*.
+
+	Stored and carried by merges, moves and saves, but no move consults it yet.
+	Because the mask defaults to GP_MOTION_BLOCKED_NONE, a block nobody has
+	constrained reads back as zero, so adding the constraint costs nothing on the
+	blocks that do not have one. */
+u8 gp_chunk_reinf_motion_block(const gp_chunk_reinf *chunk, u32 x, u32 y, u32 z);
+
+/* Replaces the mask, masking `blocked` down to the six real directions. Creates a
+   record on a block that has none, since a constraint is meaningful without any
+   reinforced face. False only when the position is invalid. */
+bool gp_chunk_reinf_motion_block_set(gp_chunk_reinf *chunk, u32 x, u32 y, u32 z, u8 blocked);
+
+/* Per block flags, a bit per GP_BLOCK_FLAG_*, or GP_BLOCK_FLAG_NONE when the block
+   carries no record at all. */
+u8 gp_chunk_reinf_flags(const gp_chunk_reinf *chunk, u32 x, u32 y, u32 z);
+
+/*
+	Writes `flags & mask` into the block's flags, leaving every other bit alone, so
+	a host can set one flag without having to know the current value of the other.
+
+	Unlike the motion mask this refuses a block with no reinforced face rather than
+	creating a record for it. Both flags describe what the protection on a block
+	means, so on an unprotected block they mean nothing, and a record holding only
+	one would outlive the block: gp_block_reinf_empty ignores the flags, so the
+	record would sit in the sparse map until the block itself was cleared. False
+	when the position is invalid or the block carries no reinforced face, in which
+	case nothing changed.
+*/
+bool gp_chunk_reinf_flags_set(gp_chunk_reinf *chunk, u32 x, u32 y, u32 z, u8 flags, u8 mask);
 
 /* Consumes one break event on `face`. Returns true while the face still has
    durability left, false once the face is exhausted and the block breaks. */
@@ -100,7 +128,11 @@ bool gp_chunk_reinf_move(gp_chunk_reinf *chunk, u32 from_x, u32 from_y, u32 from
    chunk it belongs to, so a cross chunk caller cannot address a local cell in
    the source chunk by mistake. `src` and `dst` may be the same chunk. Refuses a
    reinforcement merge that would need more distinct faces than the record can
-   hold, rather than dropping one. */
+   hold, rather than dropping one.
+
+   Flags on a face shared by both blocks are or'd, and so are the per block
+   flags and the motion mask, so a constraint held at either end of a push
+   survives the merge. */
 bool gp_chunk_reinf_transfer(gp_chunk_reinf *src, u32 from_x, u32 from_y, u32 from_z,
                              gp_chunk_reinf *dst, u32 to_x, u32 to_y, u32 to_z);
 

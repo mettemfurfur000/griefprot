@@ -136,6 +136,14 @@ build/$(ABI_MAIN): $(ABI_TEST_OBJ) $(ABI_OBJ) $(OBJS)
 	mkdir -p build
 	$(CC) $(CFLAGS) -o $@ $(ABI_TEST_OBJ) $(ABI_OBJ) $(OBJS) $(TEMBLIB_ARCHIVE) $(LDFLAGS) $(TEMBLIB_LIBS)
 
+# Builds the Paper plugin: the shim, the staged jar resource, then the jar.
+# A recipe rather than a $(shell ...) so it runs when asked for and its exit
+# status stops the build. Everything lives in the script, which also needs a
+# JDK and Maven and so cannot be spelled out here.
+.PHONY: java-plugin
+java-plugin:
+	./scripts/build_plugin.sh package
+
 clean:
 	rm -rf build/*
 	rm -rf obj/*
